@@ -31,12 +31,28 @@ export interface OtherFileDiagnostics {
   topDiagnostics: Diagnostic[];
 }
 
+export type DiagnosticClassification = "new" | "pre-existing";
+
+export interface ClassifiedDiagnostic {
+  diagnostic: Diagnostic;
+  classification: DiagnosticClassification;
+}
+
+export type DiagnosticDelta =
+  | { hasBaseline: false }
+  | {
+    hasBaseline: true;
+    diagnostics: ClassifiedDiagnostic[];
+    fixedCount: number;
+  };
+
 export interface DiagnosticResult {
   status: "ok" | "timeout" | "unavailable";
   diagnostics: Diagnostic[];
   otherFiles: OtherFileDiagnostics[];
   retryAttempts: number;
   retryable?: boolean;
+  delta?: DiagnosticDelta;
 }
 
 export interface LspClient {
