@@ -31,7 +31,7 @@ agent calls write/edit
   → index.ts: check file extension, resolve absolute path, enforce cwd boundary
   → server-manager.ts: find workspace root, ensure server, queue edit
   → client.ts: send didOpen/didChange, then pull diagnostics or wait for a push update
-  → format.ts: filter to errors+warnings, format text, add cross-file footer
+  → format.ts: filter to errors+warnings, add source context, format compiler-style text and cross-file details
   → index.ts: append formatted text to tool_result content
 ```
 
@@ -47,7 +47,7 @@ Each `ManagedServer` has an `editQueue` promise chain. Edits to the same server 
 
 ### Pull and push diagnostics
 
-The client advertises LSP 3.17 document diagnostic support. If the server returns a `diagnosticProvider`, the client sends `textDocument/diagnostic` after each edit. It stores each `resultId` and sends it as `previousResultId` on the next request. Full reports replace the stored pull diagnostics, while unchanged reports keep them.
+The client advertises LSP 3.17 document diagnostic support and related diagnostic information. If the server returns a `diagnosticProvider`, the client sends `textDocument/diagnostic` after each edit. It stores each `resultId` and sends it as `previousResultId` on the next request. Full reports replace the stored pull diagnostics, while unchanged reports keep them.
 
 The client stores push and pull diagnostics separately. A full pull clears push diagnostics for the same URI when they predate the request. Push diagnostics that arrive during or after the pull remain in the merged result. After all pull requests finish, a 200 ms quiet period collects project diagnostics that the server sends through `publishDiagnostics`.
 
@@ -77,8 +77,18 @@ handleEdit(lib.ts):
   ├─ 200ms pass, no more publishes
   │  → settle("ok")
   │
-  └─ result: { status:"ok", diagnostics:[], otherFiles:[{caller.ts, errors:1}] }
+  └─ result: { status:"ok", diagnostics:[], otherFiles:[{caller.ts, errors:1, topDiagnostics:[...]}] }
 ```
+
+### Diagnostic output
+
+The server manager reads an edited document once and sends that content to the server. The diagnostic result contains the same content, so the formatter avoids a second file read. Each excerpt matches the content that the server checked.
+
+Each diagnostic uses `path:line:column: severity[code]: message [source]`. The formatter omits absent codes and sources. It shows the source line for the first five target-file diagnostics. It trims each source line and limits it to 120 characters.
+
+The client requests `relatedInformation` and keeps the full `Diagnostic` objects. The formatter shows at most two related locations per diagnostic. It converts file URIs to paths relative to the session directory.
+
+For each changed cross-file result, the client keeps up to three diagnostics. Errors come before warnings. The cross-file footer uses the same line formatter as target-file results and `/lsp-diag`.
 
 ### Per-language diagnostic timeouts
 
