@@ -60,6 +60,16 @@ function makeDiagnostic(message: string, line = 0): Diagnostic {
   };
 }
 
+async function waitForServerStart(
+  manager: ReturnType<typeof createServerManager>,
+): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (manager.status().length === 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(manager.status().length > 0, "server should start");
+}
+
 describe("Diagnostic delta", () => {
   it("classifies duplicate fingerprints with multiset semantics", () => {
     const duplicate = makeDiagnostic("duplicate");
@@ -306,6 +316,146 @@ describe("ServerManager", () => {
 
     assert.equal(manager.status().length, 0);
     assert.ok(elapsed < 15_000, `shutdownAll took ${elapsed}ms, expected < 15s`);
+  });
+});
+
+describe("Abort handling", () => {
+  it("rejects a pre-aborted edit without starting a server", async () => {
+    const manager = createServerManager();
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package main");
+    const controller = new AbortController();
+    controller.abort();
+
+    await assert.rejects(
+      manager.handleEdit(filePath, fakeConfig, dir, { signal: controller.signal }),
+      (error: Error) => error.name === "AbortError",
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(manager.status().length, 0);
+
+    await manager.shutdownAll();
+  });
+
+  it("aborts retry backoff and skips remaining attempts", async () => {
+    const retryConfig: LanguageServerConfig = {
+      id: "fake-abort-retry",
+      extensions: [".go"],
+      command: tsxPath,
+      args: [fakeServerPath, "--run", '--options={"publishOnAttempt":2}'],
+      rootPatterns: ["go.mod"],
+    };
+    const manager = createServerManager({ diagnosticTimeout: 100, maxRetries: 3 });
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package main");
+    const controller = new AbortController();
+
+    const pending = manager.handleEdit(filePath, retryConfig, dir, {
+      signal: controller.signal,
+    });
+    await waitForServerStart(manager);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const abortTime = Date.now();
+    controller.abort();
+
+    await assert.rejects(pending, (error: Error) => error.name === "AbortError");
+    assert.ok(Date.now() - abortTime < 250, "backoff should abort promptly");
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    assert.equal(manager.getAllDiagnostics().size, 0, "abort should prevent the retry");
+
+    await manager.shutdownAll();
+  });
+
+  it("caller abort cancels an unshared server startup", async () => {
+    const slowInitConfig: LanguageServerConfig = {
+      id: "fake-abort-caller-init",
+      extensions: [".go"],
+      command: tsxPath,
+      args: [fakeServerPath, "--run", '--options={"initializeDelay":2000}'],
+      rootPatterns: ["go.mod"],
+    };
+    const recoveredConfig: LanguageServerConfig = {
+      ...slowInitConfig,
+      args: [fakeServerPath, "--run"],
+    };
+    const manager = createServerManager();
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package main");
+    const controller = new AbortController();
+
+    const pending = manager.handleEdit(filePath, slowInitConfig, dir, {
+      signal: controller.signal,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    controller.abort();
+    await assert.rejects(pending, (error: Error) => error.name === "AbortError");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(manager.status().length, 0);
+
+    const recovered = await manager.handleEdit(filePath, recoveredConfig, dir);
+    assert.equal(recovered.status, "ok");
+    await manager.shutdownAll();
+  });
+
+  it("shutdown drains a server that is still initializing", async () => {
+    const slowInitConfig: LanguageServerConfig = {
+      id: "fake-abort-init",
+      extensions: [".go"],
+      command: tsxPath,
+      args: [fakeServerPath, "--run", '--options={"initializeDelay":2000}'],
+      rootPatterns: ["go.mod"],
+    };
+    const manager = createServerManager();
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package main");
+
+    const pending = manager.handleEdit(filePath, slowInitConfig, dir);
+    const rejection = assert.rejects(
+      pending,
+      (error: Error) => error.name === "AbortError",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await manager.shutdownAll();
+    await rejection;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    assert.equal(manager.status().length, 0);
+  });
+
+  it("shutdown aborts validation before server teardown", async () => {
+    const neverPublishConfig: LanguageServerConfig = {
+      id: "fake-abort-shutdown",
+      extensions: [".go"],
+      command: tsxPath,
+      args: [fakeServerPath, "--run", '--options={"neverPublish":true}'],
+      rootPatterns: ["go.mod"],
+    };
+    const manager = createServerManager({ diagnosticTimeout: 10_000 });
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package main");
+
+    const pending = manager.handleEdit(filePath, neverPublishConfig, dir);
+    const rejection = assert.rejects(
+      pending,
+      (error: Error) => error.name === "AbortError",
+    );
+    await waitForServerStart(manager);
+    const start = Date.now();
+    await manager.shutdownAll();
+    await rejection;
+
+    assert.ok(Date.now() - start < 1_000, "shutdown should not wait for diagnostics");
+    assert.equal(manager.status().length, 0);
   });
 });
 

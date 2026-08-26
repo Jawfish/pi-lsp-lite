@@ -416,6 +416,50 @@ describe("LspClient", () => {
     await client.shutdown();
   });
 
+  it("aborts a push wait promptly and clears its waiter", async () => {
+    const child = spawnFake({ publishOnAttempt: 2 });
+    const client = createLspClient(child);
+    await client.initialize("/tmp/test-workspace");
+
+    const uri = "file:///tmp/test-workspace/abort.go";
+    client.didOpen(uri, "go", "package main");
+    const controller = new AbortController();
+    const start = Date.now();
+    const pending = client.waitForDiagnostics(uri, 10_000, controller.signal);
+    setTimeout(() => controller.abort(), 25);
+
+    await assert.rejects(pending, (error: Error) => error.name === "AbortError");
+    assert.ok(Date.now() - start < 500, "push wait should abort promptly");
+
+    client.didChange(uri, "package main\n");
+    const next = await client.waitForDiagnostics(uri, 2_000);
+    assert.equal(next.status, "ok");
+    assert.equal(next.diagnostics.length, 1);
+
+    await client.shutdown();
+  });
+
+  it("aborts active pull requests promptly", async () => {
+    const uri = "file:///tmp/test-workspace/abort.ts";
+    const child = spawnFake({
+      neverPullUris: [uri],
+      pullDiagnostics: true,
+    });
+    const client = createLspClient(child);
+    await client.initialize("/tmp/test-workspace");
+
+    client.didOpen(uri, "typescript", "const value = 1;");
+    const controller = new AbortController();
+    const start = Date.now();
+    const pending = client.waitForDiagnostics(uri, 10_000, controller.signal);
+    setTimeout(() => controller.abort(), 25);
+
+    await assert.rejects(pending, (error: Error) => error.name === "AbortError");
+    assert.ok(Date.now() - start < 500, "pull wait should abort promptly");
+
+    await client.shutdown();
+  });
+
   it("returns latest diagnostics after rapid didChange", async () => {
     const uri = "file:///tmp/test-workspace/main.go";
     const child = spawnFake({

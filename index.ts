@@ -10,6 +10,7 @@ import { buildServerStates, formatServerStates } from "./src/status.js";
 import { resolve } from "node:path";
 import { lstat, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { isAbortError } from "./src/abort.js";
 
 export default function (pi: ExtensionAPI) {
   let servers: LanguageServerConfig[] = [];
@@ -89,7 +90,10 @@ export default function (pi: ExtensionAPI) {
     if (!langConfig) return;
 
     try {
-      const result = await manager.handleEdit(absolutePath, langConfig, ctx.cwd, { isNewFile });
+      const result = await manager.handleEdit(absolutePath, langConfig, ctx.cwd, {
+        isNewFile,
+        signal: ctx.signal,
+      });
       const formatted = formatDiagnostics(filePath, result, ctx.cwd, result.documentContent);
       if (!formatted) return;
 
@@ -99,6 +103,7 @@ export default function (pi: ExtensionAPI) {
         content: [...event.content, { type: "text" as const, text: formatted }],
       };
     } catch (err) {
+      if (ctx.signal?.aborted || isAbortError(err)) return;
       console.error("[pi-lsp-lite]", err);
     }
   });

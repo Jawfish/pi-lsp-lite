@@ -25,6 +25,7 @@ import {
 export interface FakeServerOptions {
   diagnosticDelay?: number;
   diagnosticsByUri?: Map<string, Diagnostic[]>;
+  initializeDelay?: number;
   otherFileDiagnostics?: Map<string, Diagnostic[]>;
   crashOnInit?: boolean;
   neverPublish?: boolean;
@@ -55,6 +56,7 @@ export function startFakeServer(options: FakeServerOptions = {}) {
   const crashOnInit = options.crashOnInit ?? false;
   const neverPublish = options.neverPublish ?? false;
   const neverShutdown = options.neverShutdown ?? false;
+  const initializeDelay = options.initializeDelay ?? 0;
   const publishOnlyOnce = options.publishOnlyOnce ?? false;
   const publishOnAttempt = options.publishOnAttempt ?? 1;
   const pullCancelAttempts = options.pullCancelAttempts ?? 0;
@@ -75,9 +77,12 @@ export function startFakeServer(options: FakeServerOptions = {}) {
     new StreamMessageWriter(process.stdout),
   );
 
-  connection.onRequest(InitializeRequest.type, (params) => {
+  connection.onRequest(InitializeRequest.type, async (params) => {
     if (crashOnInit) {
       process.exit(1);
+    }
+    if (initializeDelay > 0) {
+      await new Promise((resolve) => setTimeout(resolve, initializeDelay));
     }
     relatedInformationSupported =
       params.capabilities.textDocument?.publishDiagnostics?.relatedInformation === true;
@@ -230,6 +235,7 @@ if (process.argv.includes("--run")) {
   if (optionsJson) {
     const raw = JSON.parse(optionsJson.slice("--options=".length));
     if (raw.diagnosticDelay) options.diagnosticDelay = raw.diagnosticDelay;
+    if (raw.initializeDelay) options.initializeDelay = raw.initializeDelay;
     if (raw.crashOnInit) options.crashOnInit = raw.crashOnInit;
     if (raw.neverPublish) options.neverPublish = raw.neverPublish;
     if (raw.neverShutdown) options.neverShutdown = raw.neverShutdown;
