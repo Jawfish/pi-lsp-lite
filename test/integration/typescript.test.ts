@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { createServerManager } from "../../src/server-manager.js";
 import { builtinLanguages as languages } from "../../src/languages.js";
 import { pollUntil } from "../poll-until.js";
+import { handleInitial } from "../server-manager-helpers.js";
 
 const tsConfig = languages.find((l) => l.id === "typescript");
 if (!tsConfig) throw new Error("typescript config not found in languages");
@@ -25,7 +26,7 @@ describe("tsgo integration", { skip: !process.env.INTEGRATION }, () => {
 
     // warmup: absorb cold start
     await writeFile(join(dir, "warmup.ts"), "const x = 1;\n");
-    const warmup = await manager.handleEdit(join(dir, "warmup.ts"), tsConfig, dir);
+    const warmup = await handleInitial(manager, join(dir, "warmup.ts"), tsConfig, dir);
     assert.notEqual(warmup.status, "unavailable", "tsgo is not available — cannot run integration tests");
   });
 
@@ -39,7 +40,7 @@ describe("tsgo integration", { skip: !process.env.INTEGRATION }, () => {
     await writeFile(filePath, "export const x = ;\n");
 
     const result = await pollUntil(
-      () => manager.handleEdit(filePath, tsConfig, dir),
+      () => handleInitial(manager, filePath, tsConfig, dir),
       (r) => r.diagnostics.some((d) => d.severity === 1),
     );
 
@@ -48,7 +49,7 @@ describe("tsgo integration", { skip: !process.env.INTEGRATION }, () => {
 
     // fix the error so it doesn't pollute subsequent tests
     await writeFile(filePath, "export const x = 42;\n");
-    await manager.handleEdit(filePath, tsConfig, dir);
+    await handleInitial(manager, filePath, tsConfig, dir);
   });
 
   it("reports no errors for repeated clean edits", { skip: process.platform === "win32" }, async () => {
@@ -56,7 +57,7 @@ describe("tsgo integration", { skip: !process.env.INTEGRATION }, () => {
     await writeFile(filePath, "export const _clean: number = 42;\nconsole.log(_clean);\n");
 
     const result = await pollUntil(
-      () => manager.handleEdit(filePath, tsConfig, dir),
+      () => handleInitial(manager, filePath, tsConfig, dir),
       (r) => !r.diagnostics.some((d) => d.severity === 1),
     );
 
@@ -64,7 +65,7 @@ describe("tsgo integration", { skip: !process.env.INTEGRATION }, () => {
     assert.equal(hasErrors, false, "expected no error diagnostics on clean file");
 
     await writeFile(filePath, "export const _clean: number = 43;\nconsole.log(_clean);\n");
-    const repeated = await manager.handleEdit(filePath, tsConfig, dir);
+    const repeated = await handleInitial(manager, filePath, tsConfig, dir);
     assert.equal(repeated.status, "ok");
     assert.equal(repeated.diagnostics.some((d) => d.severity === 1), false);
   });
@@ -80,8 +81,8 @@ describe("tsgo integration", { skip: !process.env.INTEGRATION }, () => {
     );
 
     // open both files so the server tracks them
-    await manager.handleEdit(join(dir, "caller.ts"), tsConfig, dir);
-    await manager.handleEdit(join(dir, "lib.ts"), tsConfig, dir);
+    await handleInitial(manager, join(dir, "caller.ts"), tsConfig, dir);
+    await handleInitial(manager, join(dir, "lib.ts"), tsConfig, dir);
 
     // break the signature
     await writeFile(
@@ -90,7 +91,7 @@ describe("tsgo integration", { skip: !process.env.INTEGRATION }, () => {
     );
 
     const result = await pollUntil(
-      () => manager.handleEdit(join(dir, "lib.ts"), tsConfig, dir),
+      () => handleInitial(manager, join(dir, "lib.ts"), tsConfig, dir),
       (r) => {
         const totalDiags = r.diagnostics.filter((d) => d.severity === 1).length
           + r.otherFiles.reduce((s, f) => s + f.errorCount, 0);

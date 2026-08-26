@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { createServerManager } from "../../src/server-manager.js";
 import { builtinLanguages as languages } from "../../src/languages.js";
 import { pollUntil } from "../poll-until.js";
+import { handleInitial } from "../server-manager-helpers.js";
 
 const cppConfig = languages.find((l) => l.id === "cpp");
 if (!cppConfig) throw new Error("cpp config not found in languages");
@@ -24,7 +25,7 @@ describe("clangd integration", { skip: !process.env.INTEGRATION }, () => {
 
     // warmup using main.c (matches compile_commands.json)
     await writeFile(join(dir, "main.c"), "int main(void) { return 0; }\n");
-    const warmup = await manager.handleEdit(join(dir, "main.c"), cppConfig, dir);
+    const warmup = await handleInitial(manager, join(dir, "main.c"), cppConfig, dir);
     assert.notEqual(warmup.status, "unavailable", "clangd is not available — cannot run integration tests");
   });
 
@@ -37,7 +38,7 @@ describe("clangd integration", { skip: !process.env.INTEGRATION }, () => {
     await writeFile(join(dir, "main.c"), '#include <stdio.h>\nint main(void) {\n    printf("hello\\n");\n    return 0;\n}\n');
 
     const result = await pollUntil(
-      () => manager.handleEdit(join(dir, "main.c"), cppConfig, dir),
+      () => handleInitial(manager, join(dir, "main.c"), cppConfig, dir),
       (r) => !r.diagnostics.some((d) => d.severity === 1),
     );
 
@@ -49,7 +50,7 @@ describe("clangd integration", { skip: !process.env.INTEGRATION }, () => {
     await writeFile(join(dir, "main.c"), "int main( { return 0; }\n");
 
     const result = await pollUntil(
-      () => manager.handleEdit(join(dir, "main.c"), cppConfig, dir),
+      () => handleInitial(manager, join(dir, "main.c"), cppConfig, dir),
       (r) => r.diagnostics.some((d) => d.severity === 1),
     );
 

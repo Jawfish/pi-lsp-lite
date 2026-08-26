@@ -18,6 +18,11 @@ export interface EditDiagnosticResult extends DiagnosticResult {
   documentContent?: string;
 }
 
+export interface EditDiagnosticOutcome {
+  initial: EditDiagnosticResult;
+  pending?: Promise<EditDiagnosticResult | null>;
+}
+
 export interface HandleEditOptions {
   isNewFile?: boolean;
   signal?: AbortSignal;
@@ -42,13 +47,21 @@ interface PendingServer {
   waiters: number;
 }
 
+interface EditProgress {
+  baseline?: Diagnostic[];
+  documentContent?: string;
+  latest?: DiagnosticResult;
+  server?: ManagedServer;
+  uri: string;
+}
+
 export interface ServerManager {
   handleEdit(
     filePath: string,
     config: LanguageServerConfig,
     cwd: string,
     options?: HandleEditOptions,
-  ): Promise<EditDiagnosticResult>;
+  ): Promise<EditDiagnosticOutcome>;
   status(): ServerStatus[];
   getAllDiagnostics(): Map<string, Diagnostic[]>;
   shutdownAll(): Promise<void>;
@@ -72,8 +85,10 @@ export interface ServerManagerOptions {
   documentIdleTimeout?: number;
   perServerTimeout?: Map<string, number>;
   maxRetries?: number;
+  softDeadline?: number;
 }
 
+const DEFAULT_SOFT_DEADLINE_MS = 10_000;
 const RETRY_BASE_DELAY_MS = 500;
 const MAX_RETRY_DELAY_MS = 30_000;
 const BENIGN_SERVER_STDERR = /^context cancel(?:l)?ed\.?$/iu;
@@ -136,6 +151,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
   const documentIdleTimeout = options.documentIdleTimeout ?? DEFAULT_DOCUMENT_IDLE_TIMEOUT;
   const perServerTimeout = options.perServerTimeout ?? new Map();
   const defaultMaxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
+  const softDeadline = options.softDeadline ?? DEFAULT_SOFT_DEADLINE_MS;
   const servers = new Map<string, ManagedServer>();
   const pending = new Map<string, PendingServer>();
   const disabledBinaries = new Set<string>();
@@ -347,17 +363,44 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     return Math.max(0, Math.min(10, Math.floor(raw)));
   }
 
+  function withDelta(
+    result: DiagnosticResult,
+    progress: EditProgress,
+  ): EditDiagnosticResult {
+    return {
+      ...result,
+      delta: progress.baseline === undefined
+        ? { hasBaseline: false }
+        : classifyDiagnostics(progress.baseline, result.diagnostics),
+      ...(progress.documentContent !== undefined
+        ? { documentContent: progress.documentContent }
+        : {}),
+    };
+  }
+
+  function partialResult(progress: EditProgress): EditDiagnosticResult {
+    const known = progress.latest ?? {
+      status: "timeout" as const,
+      diagnostics: progress.server?.client.getAllDiagnostics().get(progress.uri) ?? [],
+      otherFiles: [],
+      retryAttempts: 0,
+    };
+    return withDelta({ ...known, status: "timeout" }, progress);
+  }
+
   async function doEdit(
     server: ManagedServer,
     filePath: string,
     options: HandleEditOptions,
+    progress: EditProgress,
   ): Promise<EditDiagnosticResult> {
     const signal = options.signal;
     signal?.throwIfAborted();
     resetIdleTimer(server);
 
-    const uri = fileUri(filePath);
-    const baseline = options.isNewFile
+    progress.server = server;
+    const uri = progress.uri;
+    progress.baseline = options.isNewFile
       ? []
       : server.openDocuments.has(uri)
       ? server.client.getAllDiagnostics().get(uri) ?? []
@@ -366,6 +409,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       encoding: "utf-8",
       signal,
     });
+    progress.documentContent = content;
     const timeout = perServerTimeout.get(server.config.id) ?? server.config.diagnosticTimeout ?? diagnosticTimeout;
     const retries = getMaxRetries(server.config);
 
@@ -384,15 +428,13 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       for (const otherFile of result.otherFiles) {
         accumulatedOtherFiles.set(otherFile.uri, otherFile);
       }
-      return { ...result, otherFiles: [...accumulatedOtherFiles.values()] };
+      const accumulated = {
+        ...result,
+        otherFiles: [...accumulatedOtherFiles.values()],
+      };
+      progress.latest = accumulated;
+      return accumulated;
     };
-
-    const withDelta = (result: DiagnosticResult): EditDiagnosticResult => ({
-      ...result,
-      delta: baseline === undefined
-        ? { hasBaseline: false }
-        : classifyDiagnostics(baseline, result.diagnostics),
-    });
 
     let lastResult = accumulateOtherFiles(
       await server.client.waitForDiagnostics(uri, timeout, signal),
@@ -418,12 +460,12 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       result.retryAttempts = attempt + 1;
 
       if (result.status === "ok") {
-        return { ...withDelta(result), documentContent: content };
+        return withDelta(result, progress);
       }
       lastResult = result;
     }
 
-    return { ...withDelta(lastResult), documentContent: content };
+    return withDelta(lastResult, progress);
   }
 
   return {
@@ -432,10 +474,11 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       config: LanguageServerConfig,
       cwd: string,
       editOptions: HandleEditOptions = {},
-    ): Promise<EditDiagnosticResult> {
+    ): Promise<EditDiagnosticOutcome> {
       const signal = editOptions.signal
         ? AbortSignal.any([editOptions.signal, shutdownController.signal])
         : shutdownController.signal;
+      const progress: EditProgress = { uri: fileUri(filePath) };
       const operation = (async () => {
         signal.throwIfAborted();
         const root = await findWorkspaceRoot(filePath, config.rootPatterns, cwd);
@@ -452,9 +495,9 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
           };
         }
 
-        // serialize edits per server to avoid concurrent waitForDiagnostics races
+        // The queue follows full validation, not the soft-deadline result.
         const result = server.editQueue.then(() =>
-          doEdit(server, filePath, { ...editOptions, signal })
+          doEdit(server, filePath, { ...editOptions, signal }, progress)
         );
         server.editQueue = result.then(
           () => undefined,
@@ -462,8 +505,35 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         );
         return result;
       })();
+      const cancellableOperation = raceWithAbort(operation, signal);
+      const deadlineController = new AbortController();
+      const deadlineSignal = AbortSignal.any([
+        signal,
+        deadlineController.signal,
+      ]);
+      const completed = cancellableOperation.then((result) => ({
+        kind: "complete" as const,
+        result,
+      }));
+      const deadline = abortableDelay(softDeadline, deadlineSignal).then(() => ({
+        kind: "deadline" as const,
+      }));
 
-      return raceWithAbort(operation, signal);
+      return Promise.race([completed, deadline])
+        .then((winner) => {
+          if (winner.kind === "complete") {
+            return {
+              initial: winner.result,
+              pending: Promise.resolve(null),
+            };
+          }
+
+          return {
+            initial: partialResult(progress),
+            pending: cancellableOperation,
+          };
+        })
+        .finally(() => deadlineController.abort());
     },
 
     status(): ServerStatus[] {

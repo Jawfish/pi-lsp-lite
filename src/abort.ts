@@ -8,7 +8,7 @@ export function abortableDelay(
   timeoutMs: number,
   signal?: AbortSignal,
 ): Promise<void> {
-  signal?.throwIfAborted();
+  if (signal?.aborted) return Promise.reject(abortReason(signal));
 
   return new Promise<void>((resolve, reject) => {
     let settled = false;

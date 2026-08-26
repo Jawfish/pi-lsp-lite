@@ -90,10 +90,15 @@ export default function (pi: ExtensionAPI) {
     if (!langConfig) return;
 
     try {
-      const result = await manager.handleEdit(absolutePath, langConfig, ctx.cwd, {
+      const outcome = await manager.handleEdit(absolutePath, langConfig, ctx.cwd, {
         isNewFile,
         signal: ctx.signal,
       });
+      void outcome.pending?.catch((error: unknown) => {
+        if (ctx.signal?.aborted || isAbortError(error)) return;
+        console.error("[pi-lsp-lite]", error);
+      });
+      const result = outcome.initial;
       const formatted = formatDiagnostics(filePath, result, ctx.cwd, result.documentContent);
       if (!formatted) return;
 
