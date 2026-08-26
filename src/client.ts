@@ -392,7 +392,7 @@ export function createLspClient(child: ChildProcess): LspClient {
               didSave: false,
             },
             publishDiagnostics: {
-              relatedInformation: false,
+              relatedInformation: true,
             },
             diagnostic: {
               dynamicRegistration: false,

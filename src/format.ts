@@ -4,6 +4,7 @@ import { isAbsolute, relative } from "node:path";
 import type { DiagnosticResult } from "./client.js";
 
 const MAX_DIAGNOSTICS_PER_FILE = 50;
+const MAX_RELATED_INFORMATION = 2;
 
 function diagnosticSeverityName(severity: Diagnostic["severity"]): string {
   switch (severity) {
@@ -24,6 +25,14 @@ function displayPath(filePath: string, cwd?: string): string {
   return cwd && isAbsolute(filePath) ? relative(cwd, filePath) : filePath;
 }
 
+function displayUri(uri: string, cwd?: string): string {
+  try {
+    return displayPath(fileURLToPath(uri), cwd);
+  } catch {
+    return uri;
+  }
+}
+
 export function formatDiagnosticLine(filePath: string, diagnostic: Diagnostic, cwd?: string): string {
   const path = displayPath(filePath, cwd);
   const line = diagnostic.range.start.line + 1;
@@ -32,6 +41,17 @@ export function formatDiagnosticLine(filePath: string, diagnostic: Diagnostic, c
   const code = diagnostic.code === undefined ? "" : `[${String(diagnostic.code)}]`;
   const source = diagnostic.source ? ` [${diagnostic.source}]` : "";
   return `  ${path}:${line}:${col}: ${severity}${code}: ${diagnostic.message}${source}`;
+}
+
+export function formatDiagnostic(filePath: string, diagnostic: Diagnostic, cwd?: string): string[] {
+  const lines = [formatDiagnosticLine(filePath, diagnostic, cwd)];
+  for (const related of diagnostic.relatedInformation?.slice(0, MAX_RELATED_INFORMATION) ?? []) {
+    const path = displayUri(related.location.uri, cwd);
+    const line = related.location.range.start.line + 1;
+    const col = related.location.range.start.character + 1;
+    lines.push(`    ↳ ${path}:${line}:${col}: ${related.message}`);
+  }
+  return lines;
 }
 
 export function formatDiagnostics(filePath: string, result: DiagnosticResult, cwd?: string): string {
@@ -56,8 +76,8 @@ export function formatDiagnostics(filePath: string, result: DiagnosticResult, cw
     return `\n⚠ LSP diagnostics for ${filePath}: no issues${otherFilesFooter(result, cwd)}`;
   }
 
-  const lines = relevant.map((diagnostic) =>
-    formatDiagnosticLine(filePath, diagnostic, cwd)
+  const lines = relevant.flatMap((diagnostic) =>
+    formatDiagnostic(filePath, diagnostic, cwd)
   );
 
   let errorCount = 0;

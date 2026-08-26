@@ -36,6 +36,45 @@ describe("LspClient", () => {
     await client.shutdown();
   });
 
+  it("advertises and preserves diagnostic related information", async () => {
+    const uri = "file:///tmp/test-workspace/main.go";
+    const relatedUri = "file:///tmp/test-workspace/types.go";
+    const child = spawnFake({
+      diagnosticsByUri: {
+        [uri]: [
+          {
+            range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+            severity: 1,
+            code: "FAKE1001",
+            message: "fake error with context",
+            source: "fake",
+            relatedInformation: [
+              {
+                location: {
+                  uri: relatedUri,
+                  range: { start: { line: 3, character: 1 }, end: { line: 3, character: 4 } },
+                },
+                message: "declared here",
+              },
+            ],
+          },
+        ],
+      },
+    });
+    const client = createLspClient(child);
+    await client.initialize("/tmp/test-workspace");
+
+    client.didOpen(uri, "go", "package main");
+    const result = await client.waitForDiagnostics(uri, 2000);
+
+    assert.equal(result.diagnostics[0].code, "FAKE1001");
+    assert.equal(result.diagnostics[0].relatedInformation?.length, 1);
+    assert.equal(result.diagnostics[0].relatedInformation?.[0].location.uri, relatedUri);
+    assert.equal(result.diagnostics[0].relatedInformation?.[0].message, "declared here");
+
+    await client.shutdown();
+  });
+
   it("returns ok with empty diagnostics for clean file", async () => {
     const child = spawnFake({
       diagnosticsByUri: { "file:///tmp/test-workspace/clean.go": [] },

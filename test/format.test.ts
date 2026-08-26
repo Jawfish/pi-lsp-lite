@@ -49,6 +49,44 @@ describe("formatDiagnostics", () => {
     );
   });
 
+  it("renders at most two related locations with relative paths", () => {
+    const diagnostic = makeDiag(DiagnosticSeverity.Error, "cannot resolve symbol");
+    diagnostic.relatedInformation = [
+      {
+        location: {
+          uri: "file:///project/src/first.ts",
+          range: { start: { line: 4, character: 2 }, end: { line: 4, character: 3 } },
+        },
+        message: "first declaration",
+      },
+      {
+        location: {
+          uri: "file:///project/src/second.ts",
+          range: { start: { line: 8, character: 0 }, end: { line: 8, character: 1 } },
+        },
+        message: "second declaration",
+      },
+      {
+        location: {
+          uri: "file:///project/src/third.ts",
+          range: { start: { line: 12, character: 1 }, end: { line: 12, character: 2 } },
+        },
+        message: "third declaration",
+      },
+    ];
+    const result: DiagnosticResult = {
+      status: "ok",
+      diagnostics: [diagnostic],
+      otherFiles: [],
+      retryAttempts: 0,
+    };
+
+    const output = formatDiagnostics("/project/src/main.ts", result, "/project");
+    assert.ok(output.includes("    ↳ src/first.ts:5:3: first declaration"));
+    assert.ok(output.includes("    ↳ src/second.ts:9:1: second declaration"));
+    assert.ok(!output.includes("third declaration"), `expected related information cap in: ${output}`);
+  });
+
   it("returns empty string for ok result with no diagnostics", () => {
     const result: DiagnosticResult = {
       status: "ok",
