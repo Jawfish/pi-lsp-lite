@@ -1,7 +1,8 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { createServerManager } from "../src/server-manager.js";
+import { classifyDiagnostics, createServerManager } from "../src/server-manager.js";
 import type { LanguageServerConfig } from "../src/languages.js";
+import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { writeFile, mkdir, rm } from "node:fs/promises";
@@ -46,6 +47,66 @@ afterEach(async () => {
   tempDirs = [];
 });
 
+function makeDiagnostic(message: string, line = 0): Diagnostic {
+  return {
+    range: {
+      start: { line, character: 0 },
+      end: { line, character: 5 },
+    },
+    severity: DiagnosticSeverity.Error,
+    message,
+    source: "fake",
+    code: "FAKE1001",
+  };
+}
+
+describe("Diagnostic delta", () => {
+  it("classifies duplicate fingerprints with multiset semantics", () => {
+    const duplicate = makeDiagnostic("duplicate");
+
+    const identical = classifyDiagnostics(
+      [duplicate, duplicate],
+      [{ ...duplicate }, { ...duplicate }],
+    );
+    assert.equal(identical.hasBaseline, true);
+    if (!identical.hasBaseline) return;
+    assert.deepEqual(
+      identical.diagnostics.map(({ classification }) => classification),
+      ["pre-existing", "pre-existing"],
+    );
+    assert.equal(identical.fixedCount, 0);
+
+    const added = classifyDiagnostics([duplicate], [duplicate, { ...duplicate }]);
+    assert.equal(added.hasBaseline, true);
+    if (!added.hasBaseline) return;
+    assert.deepEqual(
+      added.diagnostics.map(({ classification }) => classification),
+      ["pre-existing", "new"],
+    );
+    assert.equal(added.fixedCount, 0);
+
+    const removed = classifyDiagnostics([duplicate, duplicate], [duplicate]);
+    assert.equal(removed.hasBaseline, true);
+    if (!removed.hasBaseline) return;
+    assert.deepEqual(
+      removed.diagnostics.map(({ classification }) => classification),
+      ["pre-existing"],
+    );
+    assert.equal(removed.fixedCount, 1);
+  });
+
+  it("ignores diagnostic positions in fingerprints", () => {
+    const baseline = makeDiagnostic("moved", 1);
+    const moved = makeDiagnostic("moved", 20);
+    const delta = classifyDiagnostics([baseline], [moved]);
+
+    assert.equal(delta.hasBaseline, true);
+    if (!delta.hasBaseline) return;
+    assert.equal(delta.diagnostics[0]?.classification, "pre-existing");
+    assert.equal(delta.fixedCount, 0);
+  });
+});
+
 describe("ServerManager", () => {
   it("first edit spawns server, second reuses it", async () => {
     const manager = createServerManager();
@@ -69,6 +130,37 @@ describe("ServerManager", () => {
     const status2 = manager.status();
     assert.equal(status2.length, 1);
     assert.equal(status2[0].pid, status1[0].pid);
+
+    await manager.shutdownAll();
+  });
+
+  it("skips the first baseline and uses zero for a newly created file", async () => {
+    const manager = createServerManager();
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const existingPath = join(dir, "existing.go");
+    const newPath = join(dir, "new.go");
+    await writeFile(existingPath, "package main");
+    await writeFile(newPath, "package main");
+
+    const first = await manager.handleEdit(existingPath, fakeConfig, dir);
+    assert.deepEqual(first.delta, { hasBaseline: false });
+
+    const second = await manager.handleEdit(existingPath, fakeConfig, dir);
+    assert.equal(second.delta.hasBaseline, true);
+    if (second.delta.hasBaseline) {
+      assert.equal(second.delta.diagnostics[0]?.classification, "pre-existing");
+      assert.equal(second.delta.fixedCount, 0);
+    }
+
+    const created = await manager.handleEdit(newPath, fakeConfig, dir, {
+      isNewFile: true,
+    });
+    assert.equal(created.delta.hasBaseline, true);
+    if (created.delta.hasBaseline) {
+      assert.equal(created.delta.diagnostics[0]?.classification, "new");
+      assert.equal(created.delta.fixedCount, 0);
+    }
 
     await manager.shutdownAll();
   });

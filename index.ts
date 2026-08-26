@@ -8,12 +8,13 @@ import { fileUri, which, isInsideCwd } from "./src/util.js";
 import { installRegistry, installCommandFor } from "./src/install-registry.js";
 import { buildServerStates, formatServerStates } from "./src/status.js";
 import { resolve } from "node:path";
-import { realpath } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 export default function (pi: ExtensionAPI) {
   let servers: LanguageServerConfig[] = [];
   let manager = createServerManager({});
+  const pendingNewFiles = new Map<string, boolean>();
 
   async function initConfig(cwd: string) {
     await manager.shutdownAll();
@@ -45,13 +46,37 @@ export default function (pi: ExtensionAPI) {
     await initConfig(ctx.cwd);
   });
 
+  pi.on("tool_call", async (event, ctx) => {
+    if (event.toolName !== "write") return;
+
+    const rawPath = event.input?.path;
+    if (typeof rawPath !== "string") return;
+    const filePath = rawPath.startsWith("@") ? rawPath.slice(1) : rawPath;
+    const absolutePath = resolve(ctx.cwd, filePath);
+    if (!isInsideCwd(absolutePath, ctx.cwd)) return;
+
+    try {
+      await lstat(absolutePath);
+      pendingNewFiles.set(event.toolCallId, false);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") {
+        pendingNewFiles.set(event.toolCallId, true);
+      }
+    }
+  });
+
   pi.on("tool_result", async (event, ctx) => {
     if (event.toolName !== "write" && event.toolName !== "edit") return;
 
+    const isNewFile = event.toolName === "write" && pendingNewFiles.get(event.toolCallId) === true;
+    if (event.toolName === "write") pendingNewFiles.delete(event.toolCallId);
+
     const rawPath = event.input?.path;
-    const filePath = typeof rawPath === "string" ? rawPath : undefined;
-    if (!filePath) return;
+    const inputPath = typeof rawPath === "string" ? rawPath : undefined;
+    if (!inputPath) return;
     if (event.isError) return;
+    const filePath = inputPath.startsWith("@") ? inputPath.slice(1) : inputPath;
 
     let absolutePath: string;
     try {
@@ -64,7 +89,7 @@ export default function (pi: ExtensionAPI) {
     if (!langConfig) return;
 
     try {
-      const result = await manager.handleEdit(absolutePath, langConfig, ctx.cwd);
+      const result = await manager.handleEdit(absolutePath, langConfig, ctx.cwd, { isNewFile });
       const formatted = formatDiagnostics(filePath, result, ctx.cwd, result.documentContent);
       if (!formatted) return;
 
@@ -79,6 +104,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    pendingNewFiles.clear();
     await manager.shutdownAll();
   });
 

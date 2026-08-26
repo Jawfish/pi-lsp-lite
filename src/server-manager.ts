@@ -1,14 +1,24 @@
 import { type ChildProcess } from "node:child_process";
 import spawn from "cross-spawn";
 import { which, fileUri, findWorkspaceRoot } from "./util.js";
-import { createLspClient, type LspClient, type DiagnosticResult } from "./client.js";
+import {
+  createLspClient,
+  type DiagnosticDelta,
+  type DiagnosticResult,
+  type LspClient,
+} from "./client.js";
 import { type LanguageServerConfig, languageIdForFile } from "./languages.js";
-import type { Diagnostic } from "vscode-languageserver-protocol";
+import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
 import { DEFAULT_DIAGNOSTIC_TIMEOUT, DEFAULT_DOCUMENT_IDLE_TIMEOUT, DEFAULT_MAX_RETRIES } from "./config.js";
 import { readFile } from "node:fs/promises";
 
 export interface EditDiagnosticResult extends DiagnosticResult {
+  delta: DiagnosticDelta;
   documentContent?: string;
+}
+
+export interface HandleEditOptions {
+  isNewFile?: boolean;
 }
 
 interface ManagedServer {
@@ -25,7 +35,12 @@ interface ManagedServer {
 }
 
 export interface ServerManager {
-  handleEdit(filePath: string, config: LanguageServerConfig, cwd: string): Promise<EditDiagnosticResult>;
+  handleEdit(
+    filePath: string,
+    config: LanguageServerConfig,
+    cwd: string,
+    options?: HandleEditOptions,
+  ): Promise<EditDiagnosticResult>;
   status(): ServerStatus[];
   getAllDiagnostics(): Map<string, Diagnostic[]>;
   shutdownAll(): Promise<void>;
@@ -54,6 +69,51 @@ export interface ServerManagerOptions {
 const RETRY_BASE_DELAY_MS = 500;
 const MAX_RETRY_DELAY_MS = 30_000;
 const BENIGN_SERVER_STDERR = /^context cancel(?:l)?ed\.?$/iu;
+
+function relevantDiagnostics(diagnostics: Diagnostic[]): Diagnostic[] {
+  return diagnostics.filter(
+    (diagnostic) =>
+      diagnostic.severity === DiagnosticSeverity.Error ||
+      diagnostic.severity === DiagnosticSeverity.Warning,
+  );
+}
+
+function deltaFingerprint(diagnostic: Diagnostic): string {
+  return JSON.stringify([
+    diagnostic.severity ?? null,
+    diagnostic.source ?? null,
+    diagnostic.code ?? null,
+    diagnostic.message,
+  ]);
+}
+
+export function classifyDiagnostics(
+  baseline: Diagnostic[],
+  current: Diagnostic[],
+): DiagnosticDelta {
+  const baselineCounts = new Map<string, number>();
+  for (const diagnostic of relevantDiagnostics(baseline)) {
+    const fingerprint = deltaFingerprint(diagnostic);
+    baselineCounts.set(fingerprint, (baselineCounts.get(fingerprint) ?? 0) + 1);
+  }
+
+  const diagnostics = relevantDiagnostics(current).map((diagnostic) => {
+    const fingerprint = deltaFingerprint(diagnostic);
+    const remaining = baselineCounts.get(fingerprint) ?? 0;
+    if (remaining > 0) {
+      if (remaining === 1) baselineCounts.delete(fingerprint);
+      else baselineCounts.set(fingerprint, remaining - 1);
+      return { diagnostic, classification: "pre-existing" as const };
+    }
+    return { diagnostic, classification: "new" as const };
+  });
+
+  const fixedCount = [...baselineCounts.values()].reduce(
+    (total, count) => total + count,
+    0,
+  );
+  return { hasBaseline: true, diagnostics, fixedCount };
+}
 
 export function filterServerStderr(value: string): string {
   return value
@@ -188,7 +248,13 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       idleTimer: null,
       startTime: now,
       lastActivity: now,
-      editQueue: Promise.resolve({ status: "ok", diagnostics: [], otherFiles: [], retryAttempts: 0 }),
+      editQueue: Promise.resolve({
+        status: "ok",
+        diagnostics: [],
+        otherFiles: [],
+        retryAttempts: 0,
+        delta: { hasBaseline: false },
+      }),
     };
 
     child.on("exit", () => {
@@ -227,10 +293,19 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     return Math.max(0, Math.min(10, Math.floor(raw)));
   }
 
-  async function doEdit(server: ManagedServer, filePath: string): Promise<EditDiagnosticResult> {
+  async function doEdit(
+    server: ManagedServer,
+    filePath: string,
+    options: HandleEditOptions,
+  ): Promise<EditDiagnosticResult> {
     resetIdleTimer(server);
 
     const uri = fileUri(filePath);
+    const baseline = options.isNewFile
+      ? []
+      : server.openDocuments.has(uri)
+      ? server.client.getAllDiagnostics().get(uri) ?? []
+      : undefined;
     const content = await readFile(filePath, "utf-8");
     const timeout = perServerTimeout.get(server.config.id) ?? server.config.diagnosticTimeout ?? diagnosticTimeout;
     const retries = getMaxRetries(server.config);
@@ -252,6 +327,13 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       }
       return { ...result, otherFiles: [...accumulatedOtherFiles.values()] };
     };
+
+    const withDelta = (result: DiagnosticResult): EditDiagnosticResult => ({
+      ...result,
+      delta: baseline === undefined
+        ? { hasBaseline: false }
+        : classifyDiagnostics(baseline, result.diagnostics),
+    });
 
     let lastResult = accumulateOtherFiles(
       await server.client.waitForDiagnostics(uri, timeout),
@@ -277,24 +359,37 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       result.retryAttempts = attempt + 1;
 
       if (result.status === "ok") {
-        return { ...result, documentContent: content };
+        return { ...withDelta(result), documentContent: content };
       }
       lastResult = result;
     }
 
-    return { ...lastResult, documentContent: content };
+    return { ...withDelta(lastResult), documentContent: content };
   }
 
   return {
-    async handleEdit(filePath: string, config: LanguageServerConfig, cwd: string): Promise<EditDiagnosticResult> {
+    async handleEdit(
+      filePath: string,
+      config: LanguageServerConfig,
+      cwd: string,
+      editOptions: HandleEditOptions = {},
+    ): Promise<EditDiagnosticResult> {
       const root = await findWorkspaceRoot(filePath, config.rootPatterns, cwd);
       const server = await ensureServer(config, root);
-      if (!server) return { status: "unavailable" as const, diagnostics: [], otherFiles: [], retryAttempts: 0 };
+      if (!server) {
+        return {
+          status: "unavailable" as const,
+          diagnostics: [],
+          otherFiles: [],
+          retryAttempts: 0,
+          delta: { hasBaseline: false },
+        };
+      }
 
       // serialize edits per server to avoid concurrent waitForDiagnostics races
       const result = server.editQueue.then(
-        () => doEdit(server, filePath),
-        () => doEdit(server, filePath),
+        () => doEdit(server, filePath, editOptions),
+        () => doEdit(server, filePath, editOptions),
       );
       server.editQueue = result;
       return result;
