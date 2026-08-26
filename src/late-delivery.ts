@@ -69,7 +69,7 @@ export async function deliverLateDiagnostics({
   sendMessage,
   signal,
 }: LateDeliveryOptions): Promise<void> {
-  if (!outcome.pending) return;
+  if (outcome.superseded || !outcome.pending) return;
   const final = await outcome.pending;
   if (signal?.aborted || !final) return;
   if (resultFingerprint(outcome.initial) === resultFingerprint(final)) return;

@@ -96,6 +96,7 @@ export default function (pi: ExtensionAPI) {
         isNewFile,
         signal: ctx.signal,
       });
+      if (outcome.superseded) return;
       void deliverLateDiagnostics({
         cwd: ctx.cwd,
         filePath,

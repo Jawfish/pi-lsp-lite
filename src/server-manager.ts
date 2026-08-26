@@ -16,7 +16,12 @@ import {
   DEFAULT_SOFT_DEADLINE,
 } from "./config.js";
 import { readFile } from "node:fs/promises";
-import { abortableDelay, isAbortError, raceWithAbort } from "./abort.js";
+import {
+  abortReason,
+  abortableDelay,
+  isAbortError,
+  raceWithAbort,
+} from "./abort.js";
 
 export interface EditDiagnosticResult extends DiagnosticResult {
   delta: DiagnosticDelta;
@@ -26,6 +31,7 @@ export interface EditDiagnosticResult extends DiagnosticResult {
 export interface EditDiagnosticOutcome {
   initial: EditDiagnosticResult;
   pending?: Promise<EditDiagnosticResult | null>;
+  superseded?: boolean;
 }
 
 export interface HandleEditOptions {
@@ -97,6 +103,17 @@ const RETRY_BASE_DELAY_MS = 500;
 const MAX_RETRY_DELAY_MS = 30_000;
 const BENIGN_SERVER_STDERR = /^context cancel(?:l)?ed\.?$/iu;
 
+class SupersededEditError extends Error {
+  constructor() {
+    super("A newer edit superseded this validation");
+    this.name = "SupersededEditError";
+  }
+}
+
+function isSupersededEdit(error: unknown): error is SupersededEditError {
+  return error instanceof SupersededEditError;
+}
+
 function relevantDiagnostics(diagnostics: Diagnostic[]): Diagnostic[] {
   return diagnostics.filter(
     (diagnostic) =>
@@ -160,6 +177,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
   const pending = new Map<string, PendingServer>();
   const disabledBinaries = new Set<string>();
   const failedRoots = new Set<string>();
+  const activeEdits = new Map<string, { controller: AbortController }>();
   const shutdownController = new AbortController();
   let sweepTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -325,6 +343,11 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     if (failedRoots.has(serverKey)) return null;
 
     let inflight = pending.get(serverKey);
+    if (inflight?.controller.signal.aborted) {
+      await raceWithAbort(inflight.promise, signal);
+      signal.throwIfAborted();
+      return ensureServer(config, root, signal);
+    }
     if (!inflight) {
       const controller = new AbortController();
       const startupSignal = AbortSignal.any([
@@ -479,10 +502,28 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       cwd: string,
       editOptions: HandleEditOptions = {},
     ): Promise<EditDiagnosticOutcome> {
-      const signal = editOptions.signal
-        ? AbortSignal.any([editOptions.signal, shutdownController.signal])
-        : shutdownController.signal;
-      const progress: EditProgress = { uri: fileUri(filePath) };
+      if (editOptions.signal?.aborted) {
+        return Promise.reject(abortReason(editOptions.signal));
+      }
+      if (shutdownController.signal.aborted) {
+        return Promise.reject(abortReason(shutdownController.signal));
+      }
+
+      const uri = fileUri(filePath);
+      const operationState = { controller: new AbortController() };
+      const wasSuperseded = (error: unknown) =>
+        isSupersededEdit(error) ||
+        isSupersededEdit(operationState.controller.signal.reason);
+      const previous = activeEdits.get(uri);
+      activeEdits.set(uri, operationState);
+      previous?.controller.abort(new SupersededEditError());
+
+      const signal = AbortSignal.any([
+        shutdownController.signal,
+        operationState.controller.signal,
+        ...(editOptions.signal ? [editOptions.signal] : []),
+      ]);
+      const progress: EditProgress = { uri };
       const operation = (async () => {
         signal.throwIfAborted();
         const root = await findWorkspaceRoot(filePath, config.rootPatterns, cwd);
@@ -510,6 +551,14 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         return result;
       })();
       const cancellableOperation = raceWithAbort(operation, signal);
+      void cancellableOperation.then(
+        () => {
+          if (activeEdits.get(uri) === operationState) activeEdits.delete(uri);
+        },
+        () => {
+          if (activeEdits.get(uri) === operationState) activeEdits.delete(uri);
+        },
+      );
       const deadlineController = new AbortController();
       const deadlineSignal = AbortSignal.any([
         signal,
@@ -532,12 +581,24 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
             };
           }
 
+          const pending = cancellableOperation.catch((error: unknown) => {
+            if (wasSuperseded(error)) return null;
+            throw error;
+          });
           return {
             initial: partialResult(progress),
-            pending: cancellableOperation,
+            pending,
           };
         })
-        .finally(() => deadlineController.abort());
+        .finally(() => deadlineController.abort())
+        .catch((error: unknown) => {
+          if (!wasSuperseded(error)) throw error;
+          return {
+            initial: partialResult(progress),
+            pending: Promise.resolve(null),
+            superseded: true,
+          };
+        });
     },
 
     status(): ServerStatus[] {
@@ -574,6 +635,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         shutdownServer(server)
       );
       await Promise.allSettled(shutdowns);
+      activeEdits.clear();
     },
   };
 }

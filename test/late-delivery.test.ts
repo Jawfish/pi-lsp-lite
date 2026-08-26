@@ -96,6 +96,23 @@ describe("late diagnostic delivery", () => {
     );
   });
 
+  it("suppresses a superseded outcome", async () => {
+    const sent: LspDiagnosticsMessage[] = [];
+
+    await deliverLateDiagnostics({
+      cwd: "/repo",
+      filePath: "src/main.ts",
+      outcome: {
+        initial: result([]),
+        pending: Promise.resolve(result([diagnostic("obsolete error")])),
+        superseded: true,
+      },
+      sendMessage: (message) => sent.push(message),
+    });
+
+    assert.equal(sent.length, 0);
+  });
+
   it("suppresses delivery after abort", async () => {
     const controller = new AbortController();
     controller.abort();

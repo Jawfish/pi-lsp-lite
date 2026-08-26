@@ -153,6 +153,8 @@ export function createLspClient(child: ChildProcess): LspClient {
 
   const diagnosticsMap = new Map<string, DiagnosticEntry>();
   const documentVersion = new Map<string, number>();
+  const lastDocumentVersion = new Map<string, number>();
+  const closedDocuments = new Set<string>();
   const uriGeneration = new Map<string, number>();
   let pullDiagnosticSupport: PullDiagnosticSupport | undefined;
   let crossFileCallback: ((changedUri: string) => void) | null = null;
@@ -401,6 +403,14 @@ export function createLspClient(child: ChildProcess): LspClient {
   };
 
   connection.onNotification(PublishDiagnosticsNotification.type, (params) => {
+    if (closedDocuments.has(params.uri)) return;
+    const currentVersion = documentVersion.get(params.uri);
+    if (
+      params.version !== undefined &&
+      currentVersion !== undefined &&
+      params.version !== currentVersion
+    ) return;
+
     const entry = diagnosticsMap.get(params.uri);
     if (entry) {
       const currentGen = uriGeneration.get(params.uri) ?? 0;
@@ -469,8 +479,11 @@ export function createLspClient(child: ChildProcess): LspClient {
 
     didOpen(uri: string, languageId: string, content: string) {
       const gen = (uriGeneration.get(uri) ?? 0) + 1;
+      const version = (lastDocumentVersion.get(uri) ?? 0) + 1;
       uriGeneration.set(uri, gen);
-      documentVersion.set(uri, 1);
+      documentVersion.set(uri, version);
+      lastDocumentVersion.set(uri, version);
+      closedDocuments.delete(uri);
       diagnosticsMap.set(uri, {
         diagnostics: [],
         generation: gen,
@@ -481,16 +494,17 @@ export function createLspClient(child: ChildProcess): LspClient {
         validated: false,
       });
       connection.sendNotification(DidOpenTextDocumentNotification.type, {
-        textDocument: { uri, languageId, version: 1, text: content },
+        textDocument: { uri, languageId, version, text: content },
       });
     },
 
     didChange(uri: string, content: string) {
-      const version = (documentVersion.get(uri) ?? 1) + 1;
+      const version = (lastDocumentVersion.get(uri) ?? 0) + 1;
       const gen = (uriGeneration.get(uri) ?? 0) + 1;
       const previous = diagnosticsMap.get(uri);
       uriGeneration.set(uri, gen);
       documentVersion.set(uri, version);
+      lastDocumentVersion.set(uri, version);
       diagnosticsMap.set(uri, {
         diagnostics: previous?.diagnostics ?? [],
         generation: gen,
@@ -510,6 +524,7 @@ export function createLspClient(child: ChildProcess): LspClient {
     didClose(uri: string) {
       const gen = (uriGeneration.get(uri) ?? 0) + 1;
       uriGeneration.set(uri, gen);
+      closedDocuments.add(uri);
       connection.sendNotification(DidCloseTextDocumentNotification.type, {
         textDocument: { uri },
       });

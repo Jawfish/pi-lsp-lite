@@ -7,5 +7,9 @@ export async function handleInitial(
   manager: ServerManager,
   ...args: Parameters<ServerManager["handleEdit"]>
 ): Promise<EditDiagnosticResult> {
-  return (await manager.handleEdit(...args)).initial;
+  const outcome = await manager.handleEdit(...args);
+  if (outcome.superseded) {
+    throw new Error("Unexpected superseded edit in test");
+  }
+  return outcome.initial;
 }

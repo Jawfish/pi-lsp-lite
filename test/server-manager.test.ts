@@ -71,6 +71,19 @@ async function waitForServerStart(
   assert.ok(manager.status().length > 0, "server should start");
 }
 
+async function waitForOpenDocument(
+  manager: ReturnType<typeof createServerManager>,
+): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (
+    manager.status()[0]?.openDocuments !== 1 &&
+    Date.now() < deadline
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(manager.status()[0]?.openDocuments, 1, "document should open");
+}
+
 describe("Diagnostic delta", () => {
   it("classifies duplicate fingerprints with multiset semantics", () => {
     const duplicate = makeDiagnostic("duplicate");
@@ -628,6 +641,92 @@ describe("Soft deadline", () => {
     );
     controller.abort();
     await rejection;
+
+    await manager.shutdownAll();
+  });
+});
+
+describe("Burst coalescing", () => {
+  it("supersedes an in-flight edit and keeps only the newest state", async () => {
+    const options = JSON.stringify({
+      diagnosticDelay: 300,
+      diagnosticsByText: {
+        "package old": [makeDiagnostic("old error")],
+        "package new": [makeDiagnostic("new error")],
+      },
+    });
+    const burstConfig: LanguageServerConfig = {
+      id: "fake-burst",
+      extensions: [".go"],
+      command: tsxPath,
+      args: [fakeServerPath, "--run", `--options=${options}`],
+      rootPatterns: ["go.mod"],
+    };
+    const manager = createServerManager({
+      diagnosticTimeout: 2_000,
+      maxRetries: 0,
+      softDeadline: 1_000,
+    });
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package old");
+
+    const firstPending = manager.handleEdit(filePath, burstConfig, dir);
+    await waitForOpenDocument(manager);
+    await writeFile(filePath, "package new");
+    const supersededAt = Date.now();
+    const secondPending = manager.handleEdit(filePath, burstConfig, dir);
+    const first = await firstPending;
+
+    assert.equal(first.superseded, true);
+    assert.ok(Date.now() - supersededAt < 250, "older edit should settle promptly");
+    assert.equal(await first.pending, null);
+
+    const second = await secondPending;
+    assert.notEqual(second.superseded, true);
+    const final = (await second.pending) ?? second.initial;
+    assert.equal(final.diagnostics[0]?.message, "new error");
+    assert.equal(
+      manager.getAllDiagnostics().values().next().value?.[0]?.message,
+      "new error",
+    );
+
+    await manager.shutdownAll();
+  });
+
+  it("restarts cold server startup for the newest edit", async () => {
+    const options = JSON.stringify({
+      initializeDelay: 500,
+      diagnosticsByText: {
+        "package first": [makeDiagnostic("first error")],
+        "package latest": [makeDiagnostic("latest error")],
+      },
+    });
+    const burstConfig: LanguageServerConfig = {
+      id: "fake-cold-burst",
+      extensions: [".go"],
+      command: tsxPath,
+      args: [fakeServerPath, "--run", `--options=${options}`],
+      rootPatterns: ["go.mod"],
+    };
+    const manager = createServerManager({ softDeadline: 1_000 });
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package first");
+
+    const firstPending = manager.handleEdit(filePath, burstConfig, dir);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await writeFile(filePath, "package latest");
+    const secondPending = manager.handleEdit(filePath, burstConfig, dir);
+
+    const first = await firstPending;
+    assert.equal(first.superseded, true);
+    const second = await secondPending;
+    const final = (await second.pending) ?? second.initial;
+    assert.notEqual(final.status, "unavailable");
+    assert.equal(final.diagnostics[0]?.message, "latest error");
 
     await manager.shutdownAll();
   });
