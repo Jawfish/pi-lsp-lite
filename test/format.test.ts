@@ -156,7 +156,7 @@ describe("formatDiagnostics", () => {
     assert.ok(output.includes("some error"));
   });
 
-  it("shows per-file detail in other-file footer", () => {
+  it("shows up to three diagnostics per file in the cross-file footer", () => {
     const result: DiagnosticResult = {
       status: "ok",
       diagnostics: [makeDiag(DiagnosticSeverity.Error, "type mismatch")],
@@ -164,22 +164,32 @@ describe("formatDiagnostics", () => {
         {
           uri: "file:///project/other.go",
           errorCount: 2,
-          warningCount: 1,
-          firstDiagnostic: { severity: DiagnosticSeverity.Error, line: 4, col: 2, message: "too many arguments", source: "compiler" },
+          warningCount: 2,
+          topDiagnostics: [
+            { ...makeDiag(DiagnosticSeverity.Error, "too many arguments", 4, 2), source: "compiler" },
+            { ...makeDiag(DiagnosticSeverity.Error, "undefined name", 7, 0), source: "compiler" },
+            { ...makeDiag(DiagnosticSeverity.Warning, "unused value", 9, 1), source: "compiler" },
+            { ...makeDiag(DiagnosticSeverity.Warning, "fourth detail", 11, 1), source: "compiler" },
+          ],
         },
         {
           uri: "file:///project/another.go",
           errorCount: 0,
-          warningCount: 3,
-          firstDiagnostic: { severity: DiagnosticSeverity.Warning, line: 0, col: 0, message: "unused import", source: "compiler" },
+          warningCount: 1,
+          topDiagnostics: [
+            { ...makeDiag(DiagnosticSeverity.Warning, "unused import"), source: "compiler" },
+          ],
         },
       ],
       retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result);
-    assert.ok(output.includes("/project/other.go (2 errors, 1 warning): error 5:3 [compiler] too many arguments"), `expected per-file detail in: ${output}`);
-    assert.ok(output.includes("/project/another.go (3 warnings): warning 1:1 [compiler] unused import"), `expected per-file detail in: ${output}`);
+    assert.ok(output.includes("/project/other.go (2 errors, 2 warnings):"), `expected per-file counts in: ${output}`);
+    assert.ok(output.includes("/project/other.go:5:3: error: too many arguments [compiler]"), `expected error detail in: ${output}`);
+    assert.ok(output.includes("/project/other.go:10:2: warning: unused value [compiler]"), `expected warning detail in: ${output}`);
+    assert.ok(!output.includes("fourth detail"), `expected three-diagnostic cap in: ${output}`);
+    assert.ok(output.includes("/project/another.go:1:1: warning: unused import [compiler]"), `expected per-file detail in: ${output}`);
   });
 
   it("shows relative paths when cwd is provided", () => {
@@ -191,21 +201,23 @@ describe("formatDiagnostics", () => {
           uri: "file:///project/src/other.go",
           errorCount: 1,
           warningCount: 0,
-          firstDiagnostic: { severity: DiagnosticSeverity.Error, line: 9, col: 4, message: "undefined: bar" },
+          topDiagnostics: [
+            { ...makeDiag(DiagnosticSeverity.Error, "undefined: bar", 9, 4), source: undefined },
+          ],
         },
       ],
       retryAttempts: 0,
     };
 
     const output = formatDiagnostics("main.go", result, "/project");
-    assert.ok(output.includes("src/other.go (1 error): error 10:5 undefined: bar"), `expected relative path in: ${output}`);
+    assert.ok(output.includes("src/other.go:10:5: error: undefined: bar"), `expected relative path in: ${output}`);
   });
 
   it("shows other-file footer even when main file has no issues", () => {
     const result: DiagnosticResult = {
       status: "ok",
       diagnostics: [],
-      otherFiles: [{ uri: "file:///project/other.go", errorCount: 1, warningCount: 0 }],
+      otherFiles: [{ uri: "file:///project/other.go", errorCount: 1, warningCount: 0, topDiagnostics: [] }],
       retryAttempts: 0,
     };
 
@@ -297,7 +309,9 @@ describe("formatDiagnostics (Windows)", { skip: process.platform !== "win32" }, 
           uri: pathToFileURL("C:\\project\\src\\other.ts").href,
           errorCount: 1,
           warningCount: 0,
-          firstDiagnostic: { severity: DiagnosticSeverity.Error, line: 9, col: 4, message: "undefined: bar" },
+          topDiagnostics: [
+            { ...makeDiag(DiagnosticSeverity.Error, "undefined: bar", 9, 4), source: undefined },
+          ],
         },
       ],
       retryAttempts: 0,
@@ -305,7 +319,7 @@ describe("formatDiagnostics (Windows)", { skip: process.platform !== "win32" }, 
 
     const output = formatDiagnostics("src\\main.ts", result, "C:\\project");
     assert.ok(
-      output.includes("src\\other.ts (1 error): error 10:5 undefined: bar"),
+      output.includes("src\\other.ts:10:5: error: undefined: bar"),
       `expected relativized windows path in: ${output}`,
     );
   });

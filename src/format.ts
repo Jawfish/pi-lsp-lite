@@ -141,11 +141,12 @@ function otherFilesFooter(result: DiagnosticResult, cwd?: string): string {
       f.errorCount > 0 ? `${f.errorCount} error${f.errorCount > 1 ? "s" : ""}` : "",
       f.warningCount > 0 ? `${f.warningCount} warning${f.warningCount > 1 ? "s" : ""}` : "",
     ].filter(Boolean).join(", ");
-    if (!f.firstDiagnostic) return `  ${path} (${counts})`;
-    const d = f.firstDiagnostic;
-    const sev = d.severity === DiagnosticSeverity.Error ? "error" : "warning";
-    const src = d.source ? `[${d.source}] ` : "";
-    return `  ${path} (${counts}): ${sev} ${d.line + 1}:${d.col + 1} ${src}${d.message}`;
+    const diagnostics = f.topDiagnostics.slice(0, 3);
+    const header = `  ${path} (${counts})${diagnostics.length > 0 ? ":" : ""}`;
+    const diagnosticLines = diagnostics.flatMap((diagnostic) =>
+      formatDiagnostic(path, diagnostic, cwd)
+    );
+    return [header, ...diagnosticLines].join("\n");
   });
   return `\n${lines.join("\n")}`;
 }

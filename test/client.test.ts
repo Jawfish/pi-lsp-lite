@@ -515,9 +515,33 @@ describe("LspClient", () => {
       otherFileDiagnostics: {
         [otherUri]: [
           {
+            range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+            severity: 2,
+            message: "first warning",
+            source: "fake",
+          },
+          {
+            range: { start: { line: 1, character: 0 }, end: { line: 1, character: 5 } },
+            severity: 1,
+            message: "first error",
+            source: "fake",
+          },
+          {
             range: { start: { line: 2, character: 0 }, end: { line: 2, character: 5 } },
             severity: 1,
-            message: "error in other file",
+            message: "second error",
+            source: "fake",
+          },
+          {
+            range: { start: { line: 3, character: 0 }, end: { line: 3, character: 5 } },
+            severity: 2,
+            message: "second warning",
+            source: "fake",
+          },
+          {
+            range: { start: { line: 4, character: 0 }, end: { line: 4, character: 5 } },
+            severity: 1,
+            message: "third error",
             source: "fake",
           },
         ],
@@ -535,7 +559,12 @@ describe("LspClient", () => {
     assert.equal(result.status, "ok");
     assert.ok(result.otherFiles.length > 0);
     assert.equal(result.otherFiles[0].uri, otherUri);
-    assert.equal(result.otherFiles[0].errorCount, 1);
+    assert.equal(result.otherFiles[0].errorCount, 3);
+    assert.equal(result.otherFiles[0].warningCount, 2);
+    assert.deepEqual(
+      result.otherFiles[0].topDiagnostics.map((diagnostic) => diagnostic.message),
+      ["first error", "second error", "third error"],
+    );
 
     await client.shutdown();
   });
