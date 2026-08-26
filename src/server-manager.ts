@@ -49,6 +49,15 @@ export interface ServerManagerOptions {
 
 const RETRY_BASE_DELAY_MS = 500;
 const MAX_RETRY_DELAY_MS = 30_000;
+const BENIGN_SERVER_STDERR = /^context cancel(?:l)?ed\.?$/iu;
+
+export function filterServerStderr(value: string): string {
+  return value
+    .split(/\r?\n/gu)
+    .filter((line) => !BENIGN_SERVER_STDERR.test(line.trim()))
+    .join("\n")
+    .trimEnd();
+}
 
 export function createServerManager(options: ServerManagerOptions = {}): ServerManager {
   const diagnosticTimeout = options.diagnosticTimeout ?? DEFAULT_DIAGNOSTIC_TIMEOUT;
@@ -135,7 +144,10 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     });
 
     child.stderr?.on("data", (chunk: Buffer) => {
-      console.error(`[pi-lsp-lite:${config.id}:${root}]`, chunk.toString().trimEnd());
+      const message = filterServerStderr(chunk.toString());
+      if (message) {
+        console.error(`[pi-lsp-lite:${config.id}:${root}]`, message);
+      }
     });
 
     child.on("error", (err) => {
