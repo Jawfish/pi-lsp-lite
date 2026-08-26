@@ -10,6 +10,12 @@ describe("installRegistry", () => {
     assert.equal(python.command.win32, "py -m pip install python-lsp-server");
   });
 
+  it("installs the native TypeScript preview", () => {
+    const typescript = installRegistry.get("typescript");
+    assert.ok(typescript);
+    assert.equal(typescript.command.default, "npm install -g @typescript/native-preview");
+  });
+
   it("resolves the default install command on non-Windows platforms", { skip: process.platform === "win32" }, () => {
     const python = installRegistry.get("python");
     assert.ok(python);

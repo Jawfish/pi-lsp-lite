@@ -44,8 +44,8 @@ describe("loadConfig", () => {
     const ts = config.servers.find((s) => s.id === "typescript");
     assert.ok(ts);
     assert.equal(ts.maxRetries, 5);
-    assert.deepEqual(ts.args, ["--stdio"]);
-    assert.equal(ts.command, "typescript-language-server");
+    assert.deepEqual(ts.args, ["--lsp", "--stdio"]);
+    assert.equal(ts.command, "tsgo");
   });
 
   it("project config in .pi/lsp-lite.json is discovered", async () => {
@@ -154,8 +154,8 @@ describe("loadConfig", () => {
     const config = await loadConfig(dir, join(dir, "nonexistent-global.json"));
     const ts = config.servers.find((s) => s.id === "typescript");
     assert.ok(ts);
-    assert.deepEqual(ts.args, ["--stdio"]);
-    assert.equal(ts.command, "typescript-language-server");
+    assert.deepEqual(ts.args, ["--lsp", "--stdio"]);
+    assert.equal(ts.command, "tsgo");
     assert.deepEqual(ts.extensions, [".ts", ".tsx", ".js", ".jsx"]);
     assert.equal(ts.maxRetries, 4);
   });

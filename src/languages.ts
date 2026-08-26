@@ -29,8 +29,8 @@ export const builtinLanguages: LanguageServerConfig[] = [
   {
     id: "typescript",
     extensions: [".ts", ".tsx", ".js", ".jsx"],
-    command: "typescript-language-server",
-    args: ["--stdio"],
+    command: "tsgo",
+    args: ["--lsp", "--stdio"],
     rootPatterns: ["tsconfig.json", "package.json"],
     diagnosticTimeout: 30_000,
     languageIds: { ".tsx": "typescriptreact", ".js": "javascript", ".jsx": "javascriptreact" },

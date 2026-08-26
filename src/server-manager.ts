@@ -238,9 +238,28 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     }
     server.openDocuments.set(uri, Date.now());
 
-    let lastResult = await server.client.waitForDiagnostics(uri, timeout);
+    const accumulatedOtherFiles = new Map<
+      string,
+      DiagnosticResult["otherFiles"][number]
+    >();
+    const accumulateOtherFiles = (result: DiagnosticResult): DiagnosticResult => {
+      for (const otherFile of result.otherFiles) {
+        accumulatedOtherFiles.set(otherFile.uri, otherFile);
+      }
+      return { ...result, otherFiles: [...accumulatedOtherFiles.values()] };
+    };
 
-    for (let attempt = 0; attempt < retries && lastResult.status === "timeout"; attempt++) {
+    let lastResult = accumulateOtherFiles(
+      await server.client.waitForDiagnostics(uri, timeout),
+    );
+
+    for (
+      let attempt = 0;
+      attempt < retries &&
+      lastResult.status === "timeout" &&
+      lastResult.retryable !== false;
+      attempt++
+    ) {
       resetIdleTimer(server);
       const baseDelay = Math.min(RETRY_BASE_DELAY_MS * 2 ** attempt, MAX_RETRY_DELAY_MS);
       const jitter = baseDelay * Math.random() * 0.5;
@@ -248,7 +267,9 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
 
       server.client.didChange(uri, content);
       server.openDocuments.set(uri, Date.now());
-      const result = await server.client.waitForDiagnostics(uri, timeout);
+      const result = accumulateOtherFiles(
+        await server.client.waitForDiagnostics(uri, timeout),
+      );
       result.retryAttempts = attempt + 1;
 
       if (result.status === "ok") {

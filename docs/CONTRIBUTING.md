@@ -17,7 +17,7 @@ npm run check
 # unit tests (no servers required)
 npm test
 
-# integration tests (requires gopls, rust-analyzer, typescript-language-server, pylsp, clangd on PATH)
+# integration tests (requires gopls, rust-analyzer, tsgo, pylsp, clangd on PATH)
 npm run test:integration
 
 # test in pi

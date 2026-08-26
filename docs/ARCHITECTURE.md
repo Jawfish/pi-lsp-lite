@@ -6,7 +6,7 @@ pi-lsp-lite is a [pi extension](https://github.com/mariozechner/pi) that hooks i
 
 ## Module layout
 
-```
+```text
 index.ts               → extension entry point
 src/
   config.ts            → config file loading, merge, and write
@@ -24,13 +24,13 @@ test/
 
 ## Data flow
 
-```
+```text
 agent calls write/edit
   → pi executes the tool, writes the file
   → tool_result event fires
   → index.ts: check file extension, resolve absolute path, enforce cwd boundary
   → server-manager.ts: find workspace root, ensure server, queue edit
-  → client.ts: send didOpen/didChange, wait for publishDiagnostics
+  → client.ts: send didOpen/didChange, then pull diagnostics or wait for a push update
   → format.ts: filter to errors+warnings, format text, add cross-file footer
   → index.ts: append formatted text to tool_result content
 ```
@@ -39,29 +39,29 @@ agent calls write/edit
 
 ### Per-URI generation counter
 
-Each `didOpen` and `didChange` increments a generation counter for that URI. The `publishDiagnostics` handler rejects notifications whose generation doesn't match the current one. This prevents stale diagnostics from a previous open/close cycle being attributed to the current state.
+Each `didOpen` and `didChange` increments a generation counter for that URI. The `publishDiagnostics` handler discards notifications from a different generation. This stops an old open or close cycle from changing the current state. Pull reports update the same stored entry and keep their `resultId` for the next request.
 
 ### Serialized edits per server
 
 Each `ManagedServer` has an `editQueue` promise chain. Edits to the same server are serialized so that `waitForDiagnostics` never has concurrent waiters on the same client. Different servers (different languages or different workspace roots) run in parallel.
 
-### Snapshot-diff with quiescence-based settling
+### Pull and push diagnostics
 
-Diagnostic collection uses a two-trigger approach to handle both direct and cross-file diagnostics:
+The client advertises LSP 3.17 document diagnostic support. If the server returns a `diagnosticProvider`, the client sends `textDocument/diagnostic` after each edit. It stores each `resultId` and sends it as `previousResultId` on the next request. Full reports replace the stored pull diagnostics, while unchanged reports keep them.
 
-**Pre-snapshot:** Before sending `didChange`, snapshot error/warning counts for all tracked URIs.
+The client stores push and pull diagnostics separately. A full pull clears push diagnostics for the same URI when they predate the request. Push diagnostics that arrive during or after the pull remain in the merged result. After all pull requests finish, a 200 ms quiet period collects project diagnostics that the server sends through `publishDiagnostics`.
 
-**Trigger 1 — target URI publishes:** When the edited file receives diagnostics, start a 200ms quiescence countdown. If no more diagnostics arrive within 200ms, settle.
+For pull servers with `interFileDependencies`, the client pulls every open document. It also accepts `relatedDocuments` from each report. This detects errors in a caller when an edit changes a library.
 
-**Trigger 2 — cross-file callback:** When *any* URI receives diagnostics, compare its new counts to the pre-snapshot (or zero if the URI was never tracked before). If counts changed (genuine cross-file impact), start the same 200ms quiescence countdown. This handles both previously-opened files and files the server publishes for autonomously (e.g. a dependent module never explicitly opened by the agent).
+Older servers use push diagnostics. Before the wait starts, the client stores the error and warning fingerprints for all tracked URIs. A target update or a changed related file starts a 200 ms quiet period. The quiet period collects notifications that arrive close together.
 
-**Why quiescence, not immediate settle:** LSP servers often publish diagnostics for multiple files in rapid succession after a change. The 200ms window collects them all before reporting.
+A push server can omit a notification when diagnostics do not change. After the target has one validated snapshot, a missing update returns a non-retryable timeout with that snapshot. An initial validation without a notification returns a retryable timeout. This avoids duplicate retries without presenting an old snapshot as current.
 
-**Why compare against the snapshot:** A stale re-publish (server re-confirming existing diagnostics) doesn't change counts relative to the snapshot, so it's ignored. Only genuine impact from the current edit triggers settling. This prevents false positives when the server republishes for unrelated files.
+If the initial validation or a pull request times out, the server manager retries the edit. The delay starts at 500 ms and doubles for each attempt. Jitter adds up to 50 percent, and the delay has a 30 second limit. The default is three retries. The final result includes `retryAttempts` and any cross-file data collected before the timeout.
 
-**Timeout fallback:** If neither trigger fires within the per-language timeout (gopls: 5s, rust-analyzer: 30s, typescript: 30s), the wait settles with `status: "timeout"`. The server-manager then retries the edit with exponential backoff (base 500ms × 2^attempt, capped at 30s per delay, plus 0-50% random jitter) up to `maxRetries` times (default 3). If any retry succeeds, that result is returned. If all retries are exhausted, the final timeout result includes `retryAttempts` so the agent/user knows the extension tried. Cross-file data collected up to that point is still included in `otherFiles`.
+Pull timeouts cancel active requests and ignore late reports. A server cancellation retries only when `retriggerRequest` is true or absent. A false value returns a non-retryable partial result. The server manager keeps cross-file diagnostics from all attempts.
 
-```
+```text
 handleEdit(lib.ts):
   snapshot: { caller.ts: {errors:0} }
   send didChange(lib.ts)
@@ -84,13 +84,13 @@ handleEdit(lib.ts):
 
 Each built-in language server has a default diagnostic timeout calibrated to its real-world performance:
 
-| Server | Timeout | Rationale |
-|--------|---------|----------|
-| gopls | 5s | Fast indexing, quick diagnostics even on cold start |
-| rust-analyzer | 30s | Slow cold start, needs workspace indexing time |
-| typescript-language-server | 30s | Cross-file analysis can be slow on workspace changes |
-| pylsp | 15s | Moderate cold start, plugin-dependent analysis speed |
-| clangd | 15s | Fast for single files, slower for projects without compile_commands.json |
+| Server        | Timeout | Rationale                                                                |
+| ------------- | ------- | ------------------------------------------------------------------------ |
+| gopls         | 5s      | Fast indexing, quick diagnostics even on cold start                      |
+| rust-analyzer | 30s     | Slow cold start, needs workspace indexing time                           |
+| tsgo          | 30s     | A cold workspace can still need project loading before the first pull    |
+| pylsp         | 15s     | Moderate cold start, plugin-dependent analysis speed                     |
+| clangd        | 15s     | Fast for single files, slower for projects without compile_commands.json |
 
 Timeouts are per-attempt — with the default `maxRetries: 3`, the worst-case total wait for rust-analyzer is 4 × 30s + backoff ≈ 2 minutes. Timeouts are overridable via `.pi-lsp-lite.json` (global `diagnosticTimeout` or per-server `servers.<id>.diagnosticTimeout`).
 
@@ -120,6 +120,7 @@ Config is loaded in three layers at `session_start`:
 3. **Project config** from `.pi-lsp-lite.json` or `.pi/lsp-lite.json` in the session's cwd
 
 Each layer merges over the previous:
+
 - New server IDs are added (global config only — project config cannot define new servers for security)
 - Existing server IDs are partially overridden (only specified fields change)
 - Project config can tune safe local behaviour (`disabled`, per-server timeout, `maxRetries`) but cannot override trusted server shape (`command`, `args`, `extensions`, `rootPatterns`) for any existing server
@@ -132,12 +133,12 @@ Config is not hot-reloaded — `/reload` picks up changes via `session_start`.
 
 ## Extension hooks used
 
-| Hook | Purpose |
-|------|---------|
-| `tool_result` | Intercept write/edit results, append diagnostics |
-| `session_start` | Load config, create server manager |
-| `session_shutdown` | Kill all servers |
-| `registerCommand` | `/lsp-status`, `/lsp-diag`, `/lsp-add`, `/lsp-remove`, `/lsp-toggle`, `/lsp-install` |
+| Hook               | Purpose                                                                              |
+| ------------------ | ------------------------------------------------------------------------------------ |
+| `tool_result`      | Intercept write/edit results, append diagnostics                                     |
+| `session_start`    | Load config, create server manager                                                   |
+| `session_shutdown` | Kill all servers                                                                     |
+| `registerCommand`  | `/lsp-status`, `/lsp-diag`, `/lsp-add`, `/lsp-remove`, `/lsp-toggle`, `/lsp-install` |
 
 ## Adding a language
 

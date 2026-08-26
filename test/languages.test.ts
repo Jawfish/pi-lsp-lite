@@ -16,6 +16,13 @@ describe("builtinLanguages", () => {
     assert.ok(ids.includes("cpp"));
   });
 
+  it("uses the native TypeScript language server", () => {
+    const typescript = builtinLanguages.find((language) => language.id === "typescript");
+    assert.ok(typescript);
+    assert.equal(typescript.command, "tsgo");
+    assert.deepEqual(typescript.args, ["--lsp", "--stdio"]);
+  });
+
   it("each entry has required fields", () => {
     for (const lang of builtinLanguages) {
       assert.ok(typeof lang.id === "string" && lang.id.length > 0, `${lang.id}: missing id`);

@@ -10,7 +10,7 @@ import { pollUntil } from "../poll-until.js";
 const tsConfig = languages.find((l) => l.id === "typescript");
 if (!tsConfig) throw new Error("typescript config not found in languages");
 
-describe("typescript-language-server integration", { skip: !process.env.INTEGRATION }, () => {
+describe("tsgo integration", { skip: !process.env.INTEGRATION }, () => {
   let manager: ReturnType<typeof createServerManager>;
   let dir: string;
 
@@ -26,7 +26,7 @@ describe("typescript-language-server integration", { skip: !process.env.INTEGRAT
     // warmup: absorb cold start
     await writeFile(join(dir, "warmup.ts"), "const x = 1;\n");
     const warmup = await manager.handleEdit(join(dir, "warmup.ts"), tsConfig, dir);
-    assert.notEqual(warmup.status, "unavailable", "typescript-language-server is not available — cannot run integration tests");
+    assert.notEqual(warmup.status, "unavailable", "tsgo is not available — cannot run integration tests");
   });
 
   after(async () => {
@@ -51,7 +51,7 @@ describe("typescript-language-server integration", { skip: !process.env.INTEGRAT
     await manager.handleEdit(filePath, tsConfig, dir);
   });
 
-  it("reports no errors for clean file", { skip: process.platform === "win32" }, async () => {
+  it("reports no errors for repeated clean edits", { skip: process.platform === "win32" }, async () => {
     const filePath = join(dir, "clean.ts");
     await writeFile(filePath, "export const _clean: number = 42;\nconsole.log(_clean);\n");
 
@@ -62,6 +62,11 @@ describe("typescript-language-server integration", { skip: !process.env.INTEGRAT
 
     const hasErrors = result.diagnostics.some((d) => d.severity === 1);
     assert.equal(hasErrors, false, "expected no error diagnostics on clean file");
+
+    await writeFile(filePath, "export const _clean: number = 43;\nconsole.log(_clean);\n");
+    const repeated = await manager.handleEdit(filePath, tsConfig, dir);
+    assert.equal(repeated.status, "ok");
+    assert.equal(repeated.diagnostics.some((d) => d.severity === 1), false);
   });
 
   it("detects cross-file breakage", async () => {

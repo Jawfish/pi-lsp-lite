@@ -2,7 +2,7 @@ import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { createServerManager } from "../src/server-manager.js";
 import type { LanguageServerConfig } from "../src/languages.js";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -313,6 +313,84 @@ describe("Retry logic", () => {
     assert.equal(result.status, "ok");
     assert.equal(result.retryAttempts, 2);
     assert.ok(result.diagnostics.length > 0);
+
+    await manager.shutdownAll();
+  });
+
+  it("does not retry when a push server omits an update after validation", async () => {
+    const publishOnceConfig: LanguageServerConfig = {
+      id: "fake-publish-once",
+      extensions: [".go"],
+      command: tsxPath,
+      args: [fakeServerPath, "--run", '--options={"publishOnlyOnce":true}'],
+      rootPatterns: ["go.mod"],
+    };
+    const manager = createServerManager({ diagnosticTimeout: 100, maxRetries: 3 });
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package main");
+
+    const first = await manager.handleEdit(filePath, publishOnceConfig, dir);
+    assert.equal(first.status, "ok");
+
+    await writeFile(filePath, "package main\n");
+    const start = Date.now();
+    const second = await manager.handleEdit(filePath, publishOnceConfig, dir);
+    const elapsed = Date.now() - start;
+
+    assert.equal(second.status, "timeout");
+    assert.equal(second.retryable, false);
+    assert.equal(second.retryAttempts, 0);
+    assert.ok(elapsed < 1_000, `should not have retried, took ${elapsed}ms`);
+
+    await manager.shutdownAll();
+  });
+
+  it("keeps cross-file diagnostics found before a pull retry", async () => {
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    const stalledPath = join(dir, "stalled.go");
+    const relatedPath = join(dir, "related.go");
+    await writeFile(filePath, "package main");
+    await writeFile(stalledPath, "package main");
+    await writeFile(relatedPath, "package main");
+
+    const stalledUri = pathToFileURL(stalledPath).href;
+    const relatedUri = pathToFileURL(relatedPath).href;
+    const options = JSON.stringify({
+      neverPullUris: [stalledUri],
+      otherFileDiagnostics: {
+        [relatedUri]: [
+          {
+            message: "related error",
+            range: {
+              end: { character: 5, line: 0 },
+              start: { character: 0, line: 0 },
+            },
+            severity: 1,
+          },
+        ],
+      },
+      pullDiagnostics: true,
+    });
+    const pullConfig: LanguageServerConfig = {
+      id: "fake-pull-retry",
+      extensions: [".go"],
+      command: tsxPath,
+      args: [fakeServerPath, "--run", `--options=${options}`],
+      rootPatterns: ["go.mod"],
+    };
+    const manager = createServerManager({ diagnosticTimeout: 100, maxRetries: 1 });
+
+    await manager.handleEdit(stalledPath, pullConfig, dir);
+    const result = await manager.handleEdit(filePath, pullConfig, dir);
+
+    assert.equal(result.status, "timeout");
+    assert.equal(result.retryAttempts, 1);
+    assert.equal(result.otherFiles[0]?.uri, relatedUri);
+    assert.equal(result.otherFiles[0]?.errorCount, 1);
 
     await manager.shutdownAll();
   });

@@ -14,8 +14,8 @@ export const installRegistry = new Map<string, InstallEntry>([
     description: "Rust language server",
   }],
   ["typescript", {
-    command: { default: "npm install -g typescript-language-server typescript" },
-    description: "TypeScript/JavaScript language server",
+    command: { default: "npm install -g @typescript/native-preview" },
+    description: "native TypeScript/JavaScript language server",
   }],
   ["python", {
     command: {
