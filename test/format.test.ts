@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { formatDiagnostics } from "../src/format.js";
+import { formatDiagnosticLine, formatDiagnostics } from "../src/format.js";
 import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
 import type { DiagnosticResult } from "../src/client.js";
 import { pathToFileURL } from "node:url";
@@ -29,10 +29,24 @@ describe("formatDiagnostics", () => {
     const output = formatDiagnostics("main.go", result);
     assert.ok(output.includes("1 error"));
     assert.ok(output.includes("1 warning"));
-    assert.ok(output.includes("error 5:11"));
-    assert.ok(output.includes("warning 2:1"));
-    assert.ok(output.includes("undefined variable"));
-    assert.ok(output.includes("unused import"));
+    assert.ok(output.includes("main.go:5:11: error: undefined variable [test]"));
+    assert.ok(output.includes("main.go:2:1: warning: unused import [test]"));
+  });
+
+  it("includes codes and omits absent code and source cleanly", () => {
+    const withCode = makeDiag(DiagnosticSeverity.Error, "not assignable", 2, 4);
+    withCode.code = "TS2322";
+    assert.equal(
+      formatDiagnosticLine("/project/src/main.ts", withCode, "/project"),
+      "  src/main.ts:3:5: error[TS2322]: not assignable [test]",
+    );
+
+    const withoutCodeOrSource = makeDiag(DiagnosticSeverity.Warning, "unused", 0, 0);
+    delete withoutCodeOrSource.source;
+    assert.equal(
+      formatDiagnosticLine("main.ts", withoutCodeOrSource),
+      "  main.ts:1:1: warning: unused",
+    );
   });
 
   it("returns empty string for ok result with no diagnostics", () => {
@@ -200,7 +214,7 @@ describe("formatDiagnostics", () => {
     const output = formatDiagnostics("main.go", result);
     assert.ok(output.includes("60 errors"), `expected full count in summary: ${output}`);
     assert.ok(output.includes("... and 10 more"), `expected truncation note: ${output}`);
-    const errorLines = output.split("\n").filter((l) => l.trimStart().startsWith("error"));
+    const errorLines = output.split("\n").filter((line) => line.includes(": error:"));
     assert.equal(errorLines.length, 50, "should show at most 50 diagnostic lines");
   });
 });

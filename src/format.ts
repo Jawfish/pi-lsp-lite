@@ -1,9 +1,38 @@
-import { DiagnosticSeverity } from "vscode-languageserver-protocol";
+import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
 import { fileURLToPath } from "node:url";
-import { relative } from "node:path";
+import { isAbsolute, relative } from "node:path";
 import type { DiagnosticResult } from "./client.js";
 
 const MAX_DIAGNOSTICS_PER_FILE = 50;
+
+function diagnosticSeverityName(severity: Diagnostic["severity"]): string {
+  switch (severity) {
+    case DiagnosticSeverity.Error:
+      return "error";
+    case DiagnosticSeverity.Warning:
+      return "warning";
+    case DiagnosticSeverity.Information:
+      return "info";
+    case DiagnosticSeverity.Hint:
+      return "hint";
+    default:
+      return "diagnostic";
+  }
+}
+
+function displayPath(filePath: string, cwd?: string): string {
+  return cwd && isAbsolute(filePath) ? relative(cwd, filePath) : filePath;
+}
+
+export function formatDiagnosticLine(filePath: string, diagnostic: Diagnostic, cwd?: string): string {
+  const path = displayPath(filePath, cwd);
+  const line = diagnostic.range.start.line + 1;
+  const col = diagnostic.range.start.character + 1;
+  const severity = diagnosticSeverityName(diagnostic.severity);
+  const code = diagnostic.code === undefined ? "" : `[${String(diagnostic.code)}]`;
+  const source = diagnostic.source ? ` [${diagnostic.source}]` : "";
+  return `  ${path}:${line}:${col}: ${severity}${code}: ${diagnostic.message}${source}`;
+}
 
 export function formatDiagnostics(filePath: string, result: DiagnosticResult, cwd?: string): string {
   const allRelevant = result.diagnostics.filter(
@@ -27,13 +56,9 @@ export function formatDiagnostics(filePath: string, result: DiagnosticResult, cw
     return `\n⚠ LSP diagnostics for ${filePath}: no issues${otherFilesFooter(result, cwd)}`;
   }
 
-  const lines = relevant.map((d) => {
-    const severity = d.severity === DiagnosticSeverity.Error ? "error" : "warning";
-    const line = d.range.start.line + 1;
-    const col = d.range.start.character + 1;
-    const source = d.source ? `[${d.source}] ` : "";
-    return `  ${severity} ${line}:${col} ${source}${d.message}`;
-  });
+  const lines = relevant.map((diagnostic) =>
+    formatDiagnosticLine(filePath, diagnostic, cwd)
+  );
 
   let errorCount = 0;
   for (const d of allRelevant) {
