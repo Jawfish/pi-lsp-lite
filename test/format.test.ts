@@ -33,6 +33,92 @@ describe("formatDiagnostics", () => {
     assert.ok(output.includes("main.go:2:1: warning: unused import [test]"));
   });
 
+  it("renders delta counts with new diagnostics and excerpts first", () => {
+    const preExisting = [
+      makeDiag(DiagnosticSeverity.Error, "old first", 0),
+      makeDiag(DiagnosticSeverity.Warning, "old second", 1),
+    ];
+    const newDiagnostics = Array.from({ length: 5 }, (_, index) =>
+      makeDiag(DiagnosticSeverity.Error, `new ${index + 1}`, index + 2),
+    );
+    const diagnostics = [
+      preExisting[0],
+      newDiagnostics[0],
+      preExisting[1],
+      ...newDiagnostics.slice(1),
+    ];
+    const result: DiagnosticResult = {
+      status: "ok",
+      diagnostics,
+      otherFiles: [],
+      retryAttempts: 0,
+      delta: {
+        hasBaseline: true,
+        diagnostics: [
+          { diagnostic: preExisting[0], classification: "pre-existing" },
+          { diagnostic: newDiagnostics[0], classification: "new" },
+          { diagnostic: preExisting[1], classification: "pre-existing" },
+          ...newDiagnostics.slice(1).map((diagnostic) => ({
+            diagnostic,
+            classification: "new" as const,
+          })),
+        ],
+        fixedCount: 1,
+      },
+    };
+    const content = [
+      "old first line",
+      "old second line",
+      "new line 1",
+      "new line 2",
+      "new line 3",
+      "new line 4",
+      "new line 5",
+    ].join("\n");
+
+    const output = formatDiagnostics("main.go", result, undefined, content);
+    assert.ok(output.includes("5 new, 2 pre-existing, 1 fixed"));
+    assert.ok(output.indexOf("new 1") < output.indexOf("  pre-existing:"));
+    assert.ok(output.indexOf("  pre-existing:") < output.indexOf("old first"));
+    assert.ok(output.includes("    | new line 5"));
+    assert.ok(!output.includes("    | old first line"), `expected new excerpts first in: ${output}`);
+  });
+
+  it("omits delta markers when classification has no baseline", () => {
+    const diagnostic = makeDiag(DiagnosticSeverity.Error, "existing error");
+    const result: DiagnosticResult = {
+      status: "ok",
+      diagnostics: [diagnostic],
+      otherFiles: [],
+      retryAttempts: 0,
+      delta: { hasBaseline: false },
+    };
+
+    const output = formatDiagnostics("main.go", result);
+    assert.ok(output.includes("1 error"));
+    assert.ok(!output.includes("pre-existing:"));
+    assert.ok(!output.includes(" fixed"));
+  });
+
+  it("reports fixed diagnostics when no findings remain", () => {
+    const result: DiagnosticResult = {
+      status: "ok",
+      diagnostics: [],
+      otherFiles: [],
+      retryAttempts: 0,
+      delta: {
+        hasBaseline: true,
+        diagnostics: [],
+        fixedCount: 2,
+      },
+    };
+
+    assert.equal(
+      formatDiagnostics("main.go", result),
+      "\n⚠ LSP diagnostics for main.go (0 new, 0 pre-existing, 2 fixed)",
+    );
+  });
+
   it("includes codes and omits absent code and source cleanly", () => {
     const withCode = makeDiag(DiagnosticSeverity.Error, "not assignable", 2, 4);
     withCode.code = "TS2322";

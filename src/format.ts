@@ -75,56 +75,110 @@ export function formatDiagnostics(
   cwd?: string,
   documentContent?: string,
 ): string {
-  const allRelevant = result.diagnostics.filter(
-    (d) => d.severity === DiagnosticSeverity.Error || d.severity === DiagnosticSeverity.Warning,
+  const delta = result.delta?.hasBaseline === true ? result.delta : undefined;
+  const classified = delta?.diagnostics.filter(
+    ({ diagnostic }) =>
+      diagnostic.severity === DiagnosticSeverity.Error ||
+      diagnostic.severity === DiagnosticSeverity.Warning,
   );
+  const allRelevant = classified?.map(({ diagnostic }) => diagnostic) ??
+    result.diagnostics.filter(
+      (diagnostic) =>
+        diagnostic.severity === DiagnosticSeverity.Error ||
+        diagnostic.severity === DiagnosticSeverity.Warning,
+    );
 
-  if (allRelevant.length === 0 && result.status === "ok" && result.otherFiles.length === 0) return "";
+  if (
+    allRelevant.length === 0 &&
+    result.status === "ok" &&
+    result.otherFiles.length === 0 &&
+    (delta?.fixedCount ?? 0) === 0
+  ) return "";
 
   if (result.status === "unavailable") {
     return `\n⚠ LSP diagnostics unavailable for ${filePath} (server missing or failed to start)`;
   }
 
-  const truncated = allRelevant.length > MAX_DIAGNOSTICS_PER_FILE;
-  const relevant = truncated ? allRelevant.slice(0, MAX_DIAGNOSTICS_PER_FILE) : allRelevant;
+  const orderedClassified = classified
+    ? [
+      ...classified.filter(({ classification }) => classification === "new"),
+      ...classified.filter(({ classification }) => classification === "pre-existing"),
+    ]
+    : undefined;
+  const orderedDiagnostics = orderedClassified?.map(({ diagnostic }) => diagnostic) ?? allRelevant;
+  const truncated = orderedDiagnostics.length > MAX_DIAGNOSTICS_PER_FILE;
+  const relevant = truncated
+    ? orderedDiagnostics.slice(0, MAX_DIAGNOSTICS_PER_FILE)
+    : orderedDiagnostics;
 
   const retryNote = result.status === "timeout" && result.retryAttempts > 0
     ? ` after ${result.retryAttempts} ${result.retryAttempts === 1 ? "retry" : "retries"}`
     : "";
 
-  if (relevant.length === 0 && result.status === "ok" && result.otherFiles.length > 0) {
+  if (!delta && relevant.length === 0 && result.status === "ok" && result.otherFiles.length > 0) {
     return `\n⚠ LSP diagnostics for ${filePath}: no issues${otherFilesFooter(result, cwd)}`;
   }
 
   const sourceLines = documentContent?.split(/\r?\n/u);
-  const lines = relevant.flatMap((diagnostic, index) =>
-    formatDiagnostic(
-      filePath,
-      diagnostic,
-      cwd,
-      index < MAX_SOURCE_EXCERPTS
-        ? sourceExcerpt(sourceLines, diagnostic.range.start.line)
-        : undefined,
-    )
-  );
+  let excerptCount = 0;
+  const renderDiagnostic = (diagnostic: Diagnostic): string[] => {
+    const excerpt = excerptCount < MAX_SOURCE_EXCERPTS
+      ? sourceExcerpt(sourceLines, diagnostic.range.start.line)
+      : undefined;
+    excerptCount++;
+    return formatDiagnostic(filePath, diagnostic, cwd, excerpt);
+  };
+
+  const lines: string[] = [];
+  if (orderedClassified) {
+    const displayed = truncated
+      ? orderedClassified.slice(0, MAX_DIAGNOSTICS_PER_FILE)
+      : orderedClassified;
+    const newDiagnostics = displayed.filter(
+      ({ classification }) => classification === "new",
+    );
+    const preExistingDiagnostics = displayed.filter(
+      ({ classification }) => classification === "pre-existing",
+    );
+    lines.push(...newDiagnostics.flatMap(({ diagnostic }) => renderDiagnostic(diagnostic)));
+    if (preExistingDiagnostics.length > 0) {
+      lines.push("  pre-existing:");
+      lines.push(...preExistingDiagnostics.flatMap(({ diagnostic }) => renderDiagnostic(diagnostic)));
+    }
+  } else {
+    lines.push(...relevant.flatMap(renderDiagnostic));
+  }
 
   let errorCount = 0;
-  for (const d of allRelevant) {
-    if (d.severity === DiagnosticSeverity.Error) errorCount++;
+  for (const diagnostic of allRelevant) {
+    if (diagnostic.severity === DiagnosticSeverity.Error) errorCount++;
   }
   const warnCount = allRelevant.length - errorCount;
+  const newCount = classified?.filter(
+    ({ classification }) => classification === "new",
+  ).length ?? 0;
+  const preExistingCount = (classified?.length ?? 0) - newCount;
 
   const summary = [
-    errorCount > 0 ? `${errorCount} error${errorCount > 1 ? "s" : ""}` : "",
-    warnCount > 0 ? `${warnCount} warning${warnCount > 1 ? "s" : ""}` : "",
+    ...(delta
+      ? [
+        `${newCount} new`,
+        `${preExistingCount} pre-existing`,
+        `${delta.fixedCount} fixed`,
+      ]
+      : [
+        errorCount > 0 ? `${errorCount} error${errorCount > 1 ? "s" : ""}` : "",
+        warnCount > 0 ? `${warnCount} warning${warnCount > 1 ? "s" : ""}` : "",
+      ]),
     result.status === "timeout" ? `timed out${retryNote}, may be incomplete` : "",
   ]
     .filter(Boolean)
     .join(", ");
 
+  const diagnosticBlock = lines.length > 0 ? `:\n${lines.join("\n")}` : "";
   const truncatedNote = truncated ? `\n  ... and ${allRelevant.length - MAX_DIAGNOSTICS_PER_FILE} more` : "";
 
-  return `\n⚠ LSP diagnostics for ${filePath} (${summary}):\n${lines.join("\n")}${truncatedNote}${otherFilesFooter(result, cwd)}`;
+  return `\n⚠ LSP diagnostics for ${filePath} (${summary})${diagnosticBlock}${truncatedNote}${otherFilesFooter(result, cwd)}`;
 }
 
 function otherFilesFooter(result: DiagnosticResult, cwd?: string): string {
