@@ -65,7 +65,7 @@ export default function (pi: ExtensionAPI) {
 
     try {
       const result = await manager.handleEdit(absolutePath, langConfig, ctx.cwd);
-      const formatted = formatDiagnostics(filePath, result, ctx.cwd);
+      const formatted = formatDiagnostics(filePath, result, ctx.cwd, result.documentContent);
       if (!formatted) return;
 
       ctx.ui.notify(formatted.trim(), "warning");

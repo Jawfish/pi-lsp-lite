@@ -5,6 +5,8 @@ import type { DiagnosticResult } from "./client.js";
 
 const MAX_DIAGNOSTICS_PER_FILE = 50;
 const MAX_RELATED_INFORMATION = 2;
+const MAX_SOURCE_EXCERPTS = 5;
+const MAX_SOURCE_EXCERPT_LENGTH = 120;
 
 function diagnosticSeverityName(severity: Diagnostic["severity"]): string {
   switch (severity) {
@@ -43,8 +45,14 @@ export function formatDiagnosticLine(filePath: string, diagnostic: Diagnostic, c
   return `  ${path}:${line}:${col}: ${severity}${code}: ${diagnostic.message}${source}`;
 }
 
-export function formatDiagnostic(filePath: string, diagnostic: Diagnostic, cwd?: string): string[] {
+export function formatDiagnostic(
+  filePath: string,
+  diagnostic: Diagnostic,
+  cwd?: string,
+  sourceExcerpt?: string,
+): string[] {
   const lines = [formatDiagnosticLine(filePath, diagnostic, cwd)];
+  if (sourceExcerpt !== undefined) lines.push(`    | ${sourceExcerpt}`);
   for (const related of diagnostic.relatedInformation?.slice(0, MAX_RELATED_INFORMATION) ?? []) {
     const path = displayUri(related.location.uri, cwd);
     const line = related.location.range.start.line + 1;
@@ -54,7 +62,19 @@ export function formatDiagnostic(filePath: string, diagnostic: Diagnostic, cwd?:
   return lines;
 }
 
-export function formatDiagnostics(filePath: string, result: DiagnosticResult, cwd?: string): string {
+function sourceExcerpt(sourceLines: string[] | undefined, line: number): string | undefined {
+  if (!sourceLines || line < 0 || line >= sourceLines.length) return undefined;
+  const trimmed = sourceLines[line].trim();
+  if (trimmed.length <= MAX_SOURCE_EXCERPT_LENGTH) return trimmed;
+  return `${trimmed.slice(0, MAX_SOURCE_EXCERPT_LENGTH - 3)}...`;
+}
+
+export function formatDiagnostics(
+  filePath: string,
+  result: DiagnosticResult,
+  cwd?: string,
+  documentContent?: string,
+): string {
   const allRelevant = result.diagnostics.filter(
     (d) => d.severity === DiagnosticSeverity.Error || d.severity === DiagnosticSeverity.Warning,
   );
@@ -76,8 +96,16 @@ export function formatDiagnostics(filePath: string, result: DiagnosticResult, cw
     return `\n⚠ LSP diagnostics for ${filePath}: no issues${otherFilesFooter(result, cwd)}`;
   }
 
-  const lines = relevant.flatMap((diagnostic) =>
-    formatDiagnostic(filePath, diagnostic, cwd)
+  const sourceLines = documentContent?.split(/\r?\n/u);
+  const lines = relevant.flatMap((diagnostic, index) =>
+    formatDiagnostic(
+      filePath,
+      diagnostic,
+      cwd,
+      index < MAX_SOURCE_EXCERPTS
+        ? sourceExcerpt(sourceLines, diagnostic.range.start.line)
+        : undefined,
+    )
   );
 
   let errorCount = 0;

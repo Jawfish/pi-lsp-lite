@@ -7,6 +7,10 @@ import type { Diagnostic } from "vscode-languageserver-protocol";
 import { DEFAULT_DIAGNOSTIC_TIMEOUT, DEFAULT_DOCUMENT_IDLE_TIMEOUT, DEFAULT_MAX_RETRIES } from "./config.js";
 import { readFile } from "node:fs/promises";
 
+export interface EditDiagnosticResult extends DiagnosticResult {
+  documentContent?: string;
+}
+
 interface ManagedServer {
   config: LanguageServerConfig;
   serverKey: string;
@@ -17,11 +21,11 @@ interface ManagedServer {
   idleTimer: ReturnType<typeof setTimeout> | null;
   startTime: number;
   lastActivity: number;
-  editQueue: Promise<DiagnosticResult>;
+  editQueue: Promise<EditDiagnosticResult>;
 }
 
 export interface ServerManager {
-  handleEdit(filePath: string, config: LanguageServerConfig, cwd: string): Promise<DiagnosticResult>;
+  handleEdit(filePath: string, config: LanguageServerConfig, cwd: string): Promise<EditDiagnosticResult>;
   status(): ServerStatus[];
   getAllDiagnostics(): Map<string, Diagnostic[]>;
   shutdownAll(): Promise<void>;
@@ -223,7 +227,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     return Math.max(0, Math.min(10, Math.floor(raw)));
   }
 
-  async function doEdit(server: ManagedServer, filePath: string): Promise<DiagnosticResult> {
+  async function doEdit(server: ManagedServer, filePath: string): Promise<EditDiagnosticResult> {
     resetIdleTimer(server);
 
     const uri = fileUri(filePath);
@@ -273,16 +277,16 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       result.retryAttempts = attempt + 1;
 
       if (result.status === "ok") {
-        return result;
+        return { ...result, documentContent: content };
       }
       lastResult = result;
     }
 
-    return lastResult;
+    return { ...lastResult, documentContent: content };
   }
 
   return {
-    async handleEdit(filePath: string, config: LanguageServerConfig, cwd: string): Promise<DiagnosticResult> {
+    async handleEdit(filePath: string, config: LanguageServerConfig, cwd: string): Promise<EditDiagnosticResult> {
       const root = await findWorkspaceRoot(filePath, config.rootPatterns, cwd);
       const server = await ensureServer(config, root);
       if (!server) return { status: "unavailable" as const, diagnostics: [], otherFiles: [], retryAttempts: 0 };

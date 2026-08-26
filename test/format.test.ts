@@ -87,6 +87,36 @@ describe("formatDiagnostics", () => {
     assert.ok(!output.includes("third declaration"), `expected related information cap in: ${output}`);
   });
 
+  it("renders five trimmed source excerpts and skips invalid ranges", () => {
+    const longLine = `  ${"x".repeat(130)}  `;
+    const content = ["  first line  ", longLine, "third", "fourth", "fifth", "sixth"].join("\n");
+    const diagnostics = Array.from({ length: 6 }, (_, line) =>
+      makeDiag(DiagnosticSeverity.Error, `issue ${line + 1}`, line),
+    );
+    const result: DiagnosticResult = {
+      status: "ok",
+      diagnostics,
+      otherFiles: [],
+      retryAttempts: 0,
+    };
+
+    const output = formatDiagnostics("main.ts", result, undefined, content);
+    assert.ok(output.includes("    | first line"));
+    assert.ok(output.includes("    | third"));
+    assert.ok(output.includes("    | fifth"));
+    assert.ok(!output.includes("    | sixth"), `expected source excerpt cap in: ${output}`);
+    const truncated = output.split("\n").find((line) => line.startsWith("    | xxx"));
+    assert.equal(truncated?.slice("    | ".length).length, 120);
+    assert.ok(truncated?.endsWith("..."));
+
+    const invalidRangeResult: DiagnosticResult = {
+      ...result,
+      diagnostics: [makeDiag(DiagnosticSeverity.Error, "outside content", 99)],
+    };
+    const invalidOutput = formatDiagnostics("main.ts", invalidRangeResult, undefined, content);
+    assert.ok(!invalidOutput.split("\n").some((line) => line.startsWith("    | ")));
+  });
+
   it("returns empty string for ok result with no diagnostics", () => {
     const result: DiagnosticResult = {
       status: "ok",
