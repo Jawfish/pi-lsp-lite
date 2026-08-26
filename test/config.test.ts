@@ -31,6 +31,7 @@ describe("loadConfig", () => {
     assert.ok(config.servers.some((s) => s.id === "typescript"));
     assert.equal(config.diagnosticTimeout, 5000);
     assert.equal(config.documentIdleTimeout, 120000);
+    assert.equal(config.softDeadline, 10000);
   });
 
   it("project config can tune existing server retry behaviour", async () => {
@@ -220,6 +221,27 @@ describe("loadConfig", () => {
     }));
     const config = await loadConfig(dir, join(dir, "nonexistent-global.json"));
     assert.equal(config.diagnosticTimeout, 5000);
+  });
+
+  it("overrides softDeadline from project config", async () => {
+    const dir = await makeTempDir();
+    await writeFile(join(dir, ".pi-lsp-lite.json"), JSON.stringify({
+      softDeadline: 8000,
+    }));
+    const config = await loadConfig(dir, join(dir, "nonexistent-global.json"));
+    assert.equal(config.softDeadline, 8000);
+  });
+
+  it("clamps softDeadline to its bounds", async () => {
+    const dir = await makeTempDir();
+    const globalPath = join(dir, "global.json");
+    await writeFile(globalPath, JSON.stringify({ softDeadline: 999999 }));
+    let config = await loadConfig(dir, globalPath);
+    assert.equal(config.softDeadline, 60000);
+
+    await writeFile(globalPath, JSON.stringify({ softDeadline: 0 }));
+    config = await loadConfig(dir, globalPath);
+    assert.equal(config.softDeadline, 1000);
   });
 
   it("overrides documentIdleTimeout", async () => {

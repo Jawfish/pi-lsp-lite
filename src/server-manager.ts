@@ -9,7 +9,12 @@ import {
 } from "./client.js";
 import { type LanguageServerConfig, languageIdForFile } from "./languages.js";
 import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
-import { DEFAULT_DIAGNOSTIC_TIMEOUT, DEFAULT_DOCUMENT_IDLE_TIMEOUT, DEFAULT_MAX_RETRIES } from "./config.js";
+import {
+  DEFAULT_DIAGNOSTIC_TIMEOUT,
+  DEFAULT_DOCUMENT_IDLE_TIMEOUT,
+  DEFAULT_MAX_RETRIES,
+  DEFAULT_SOFT_DEADLINE,
+} from "./config.js";
 import { readFile } from "node:fs/promises";
 import { abortableDelay, isAbortError, raceWithAbort } from "./abort.js";
 
@@ -88,7 +93,6 @@ export interface ServerManagerOptions {
   softDeadline?: number;
 }
 
-const DEFAULT_SOFT_DEADLINE_MS = 10_000;
 const RETRY_BASE_DELAY_MS = 500;
 const MAX_RETRY_DELAY_MS = 30_000;
 const BENIGN_SERVER_STDERR = /^context cancel(?:l)?ed\.?$/iu;
@@ -151,7 +155,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
   const documentIdleTimeout = options.documentIdleTimeout ?? DEFAULT_DOCUMENT_IDLE_TIMEOUT;
   const perServerTimeout = options.perServerTimeout ?? new Map();
   const defaultMaxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
-  const softDeadline = options.softDeadline ?? DEFAULT_SOFT_DEADLINE_MS;
+  const softDeadline = options.softDeadline ?? DEFAULT_SOFT_DEADLINE;
   const servers = new Map<string, ManagedServer>();
   const pending = new Map<string, PendingServer>();
   const disabledBinaries = new Set<string>();

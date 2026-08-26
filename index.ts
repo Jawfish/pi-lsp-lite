@@ -11,6 +11,7 @@ import { resolve } from "node:path";
 import { lstat, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { isAbortError } from "./src/abort.js";
+import { deliverLateDiagnostics } from "./src/late-delivery.js";
 
 export default function (pi: ExtensionAPI) {
   let servers: LanguageServerConfig[] = [];
@@ -25,6 +26,7 @@ export default function (pi: ExtensionAPI) {
       diagnosticTimeout: resolved.diagnosticTimeout,
       documentIdleTimeout: resolved.documentIdleTimeout,
       perServerTimeout: resolved.perServerTimeout,
+      softDeadline: resolved.softDeadline,
     });
 
     for (const warning of checkExtensionOverlaps(servers)) {
@@ -94,7 +96,13 @@ export default function (pi: ExtensionAPI) {
         isNewFile,
         signal: ctx.signal,
       });
-      void outcome.pending?.catch((error: unknown) => {
+      void deliverLateDiagnostics({
+        cwd: ctx.cwd,
+        filePath,
+        outcome,
+        sendMessage: (message, options) => pi.sendMessage(message, options),
+        signal: ctx.signal,
+      }).catch((error: unknown) => {
         if (ctx.signal?.aborted || isAbortError(error)) return;
         console.error("[pi-lsp-lite]", error);
       });
