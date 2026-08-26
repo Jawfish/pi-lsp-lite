@@ -68,16 +68,19 @@ export function startFakeServer(options: FakeServerOptions = {}) {
   const pushAfterPullOnlyOnce = options.pushAfterPullOnlyOnce ?? false;
   const attemptCounts = new Map<string, number>();
   const pullCounts = new Map<string, number>();
+  let relatedInformationSupported = false;
 
   const connection = createProtocolConnection(
     new StreamMessageReader(process.stdin),
     new StreamMessageWriter(process.stdout),
   );
 
-  connection.onRequest(InitializeRequest.type, (_params) => {
+  connection.onRequest(InitializeRequest.type, (params) => {
     if (crashOnInit) {
       process.exit(1);
     }
+    relatedInformationSupported =
+      params.capabilities.textDocument?.publishDiagnostics?.relatedInformation === true;
     const result: InitializeResult = {
       capabilities: {
         textDocumentSync: 1 as TextDocumentSyncKind,
@@ -95,6 +98,11 @@ export function startFakeServer(options: FakeServerOptions = {}) {
 
   connection.onNotification(InitializedNotification.type, () => {});
 
+  function diagnosticsForClient(diagnostics: Diagnostic[]): Diagnostic[] {
+    if (relatedInformationSupported) return diagnostics;
+    return diagnostics.map(({ relatedInformation: _relatedInformation, ...diagnostic }) => diagnostic);
+  }
+
   function publishDiagnostics(uri: string) {
     if (neverPublish || pullDiagnostics) return;
 
@@ -103,7 +111,9 @@ export function startFakeServer(options: FakeServerOptions = {}) {
 
     if (count < publishOnAttempt || (publishOnlyOnce && count > 1)) return;
 
-    const diags = options.diagnosticsByUri?.get(uri) ?? [defaultDiagnostic];
+    const diags = diagnosticsForClient(
+      options.diagnosticsByUri?.get(uri) ?? [defaultDiagnostic],
+    );
 
     const publish = () => {
       connection.sendNotification(PublishDiagnosticsNotification.type, {
@@ -116,7 +126,7 @@ export function startFakeServer(options: FakeServerOptions = {}) {
           if (otherUri === uri) continue;
           connection.sendNotification(PublishDiagnosticsNotification.type, {
             uri: otherUri,
-            diagnostics: otherDiags,
+            diagnostics: diagnosticsForClient(otherDiags),
           });
         }
       }
@@ -172,7 +182,7 @@ export function startFakeServer(options: FakeServerOptions = {}) {
         setTimeout(() => {
           for (const [uri, diagnostics] of options.pushAfterPullDiagnostics ?? []) {
             connection.sendNotification(PublishDiagnosticsNotification.type, {
-              diagnostics,
+              diagnostics: diagnosticsForClient(diagnostics),
               uri,
             });
           }
@@ -185,7 +195,7 @@ export function startFakeServer(options: FakeServerOptions = {}) {
               .map(([uri, items]) => [
                 uri,
                 {
-                  items,
+                  items: diagnosticsForClient(items),
                   kind: DocumentDiagnosticReportKind.Full,
                   resultId: `related-${count}`,
                 } satisfies FullDocumentDiagnosticReport,
@@ -193,7 +203,9 @@ export function startFakeServer(options: FakeServerOptions = {}) {
           )
         : undefined;
       return {
-        items: options.diagnosticsByUri?.get(params.textDocument.uri) ?? [defaultDiagnostic],
+        items: diagnosticsForClient(
+          options.diagnosticsByUri?.get(params.textDocument.uri) ?? [defaultDiagnostic],
+        ),
         kind: DocumentDiagnosticReportKind.Full,
         resultId: String(count),
         ...(relatedDocuments ? { relatedDocuments } : {}),

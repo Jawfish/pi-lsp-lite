@@ -28,7 +28,7 @@ export interface OtherFileDiagnostics {
   uri: string;
   errorCount: number;
   warningCount: number;
-  firstDiagnostic?: { severity: number; line: number; col: number; message: string; source?: string };
+  topDiagnostics: Diagnostic[];
 }
 
 export interface DiagnosticResult {
@@ -51,6 +51,7 @@ export interface LspClient {
 
 const SHUTDOWN_TIMEOUT_MS = 5_000;
 const QUIESCENCE_MS = 200;
+const MAX_DIAGNOSTICS_PER_OTHER_FILE = 3;
 
 function countDiagnostics(diags: Diagnostic[]): { errors: number; warnings: number } {
   let errors = 0;
@@ -156,22 +157,17 @@ export function createLspClient(child: ChildProcess): LspClient {
       const preFp = preSnapshot.get(trackedUri) ?? new Set();
       if (setsEqual(postFp, preFp)) continue;
       const post = countDiagnostics(entry.diagnostics);
-      const first =
-        entry.diagnostics.find((d) => d.severity === DiagnosticSeverity.Error) ??
-        entry.diagnostics.find((d) => d.severity === DiagnosticSeverity.Warning);
+      const errors = entry.diagnostics.filter(
+        (diagnostic) => diagnostic.severity === DiagnosticSeverity.Error,
+      );
+      const warnings = entry.diagnostics.filter(
+        (diagnostic) => diagnostic.severity === DiagnosticSeverity.Warning,
+      );
       result.push({
         uri: trackedUri,
         errorCount: post.errors,
         warningCount: post.warnings,
-        ...(first && {
-          firstDiagnostic: {
-            severity: first.severity ?? DiagnosticSeverity.Error,
-            line: first.range.start.line,
-            col: first.range.start.character,
-            message: diagnosticMessage(first),
-            ...(first.source && { source: first.source }),
-          },
-        }),
+        topDiagnostics: [...errors, ...warnings].slice(0, MAX_DIAGNOSTICS_PER_OTHER_FILE),
       });
     }
     return result;
@@ -392,7 +388,7 @@ export function createLspClient(child: ChildProcess): LspClient {
               didSave: false,
             },
             publishDiagnostics: {
-              relatedInformation: false,
+              relatedInformation: true,
             },
             diagnostic: {
               dynamicRegistration: false,

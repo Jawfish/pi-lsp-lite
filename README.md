@@ -25,12 +25,17 @@ That's it. If you have `gopls`, `rust-analyzer`, `tsgo`, `pylsp`, or `clangd` on
   ✓ Edited src/main.go (replaced 2 lines)
 
   ⚠ LSP diagnostics for src/main.go (2 errors):
-    error 12:5 [compiler] undefined: foo
-    error 18:2 [compiler] too many arguments in call to bar
-    + 1 diagnostic in 1 other file
+    src/main.go:12:5: error[UndeclaredName]: undefined: foo [compiler]
+      | return foo()
+      ↳ src/helpers.go:3:1: foo was declared here
+    src/main.go:18:2: error[WrongArgCount]: too many arguments in call to bar [compiler]
+      | bar(first, second)
+    src/caller.go (2 errors):
+    src/caller.go:8:3: error[UnknownField]: unknown field value [compiler]
+    src/caller.go:14:7: error[TypeMismatch]: cannot use string as int [compiler]
 ```
 
-The agent sees these too — they're appended to the tool result, so it can self-correct on the same turn.
+The extension appends these diagnostics to the tool result, so the agent can self-correct in the same turn. The first five diagnostics include a source line, trimmed to 120 characters. Each diagnostic can show two related locations. A changed cross-file result can show three diagnostics per file, with errors first.
 
 ## Commands
 

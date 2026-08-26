@@ -1,11 +1,80 @@
-import { DiagnosticSeverity } from "vscode-languageserver-protocol";
+import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
 import { fileURLToPath } from "node:url";
-import { relative } from "node:path";
+import { isAbsolute, relative } from "node:path";
 import type { DiagnosticResult } from "./client.js";
 
 const MAX_DIAGNOSTICS_PER_FILE = 50;
+const MAX_RELATED_INFORMATION = 2;
+const MAX_SOURCE_EXCERPTS = 5;
+const MAX_SOURCE_EXCERPT_LENGTH = 120;
 
-export function formatDiagnostics(filePath: string, result: DiagnosticResult, cwd?: string): string {
+function diagnosticSeverityName(severity: Diagnostic["severity"]): string {
+  switch (severity) {
+    case DiagnosticSeverity.Error:
+      return "error";
+    case DiagnosticSeverity.Warning:
+      return "warning";
+    case DiagnosticSeverity.Information:
+      return "info";
+    case DiagnosticSeverity.Hint:
+      return "hint";
+    default:
+      return "diagnostic";
+  }
+}
+
+function displayPath(filePath: string, cwd?: string): string {
+  return cwd && isAbsolute(filePath) ? relative(cwd, filePath) : filePath;
+}
+
+function displayUri(uri: string, cwd?: string): string {
+  try {
+    return displayPath(fileURLToPath(uri), cwd);
+  } catch {
+    return uri;
+  }
+}
+
+export function formatDiagnosticLine(filePath: string, diagnostic: Diagnostic, cwd?: string): string {
+  const path = displayPath(filePath, cwd);
+  const line = diagnostic.range.start.line + 1;
+  const col = diagnostic.range.start.character + 1;
+  const severity = diagnosticSeverityName(diagnostic.severity);
+  const code = diagnostic.code === undefined ? "" : `[${String(diagnostic.code)}]`;
+  const source = diagnostic.source ? ` [${diagnostic.source}]` : "";
+  return `  ${path}:${line}:${col}: ${severity}${code}: ${diagnostic.message}${source}`;
+}
+
+export function formatDiagnostic(
+  filePath: string,
+  diagnostic: Diagnostic,
+  cwd?: string,
+  sourceExcerpt?: string,
+): string[] {
+  const lines = [formatDiagnosticLine(filePath, diagnostic, cwd)];
+  if (sourceExcerpt !== undefined) lines.push(`    | ${sourceExcerpt}`);
+  for (const related of diagnostic.relatedInformation?.slice(0, MAX_RELATED_INFORMATION) ?? []) {
+    const path = displayUri(related.location.uri, cwd);
+    const line = related.location.range.start.line + 1;
+    const col = related.location.range.start.character + 1;
+    lines.push(`    ↳ ${path}:${line}:${col}: ${related.message}`);
+  }
+  return lines;
+}
+
+function sourceExcerpt(sourceLines: string[] | undefined, line: number): string | undefined {
+  if (!sourceLines || line < 0 || line >= sourceLines.length) return undefined;
+  const trimmed = sourceLines[line].trim();
+  if (trimmed.length <= MAX_SOURCE_EXCERPT_LENGTH) return trimmed;
+  return `${trimmed.slice(0, MAX_SOURCE_EXCERPT_LENGTH - 3)}...`;
+}
+
+export function formatDiagnostics(
+  filePath: string,
+  result: DiagnosticResult,
+  cwd?: string,
+  documentContent?: string,
+): string {
   const allRelevant = result.diagnostics.filter(
     (d) => d.severity === DiagnosticSeverity.Error || d.severity === DiagnosticSeverity.Warning,
   );
@@ -27,13 +96,17 @@ export function formatDiagnostics(filePath: string, result: DiagnosticResult, cw
     return `\n⚠ LSP diagnostics for ${filePath}: no issues${otherFilesFooter(result, cwd)}`;
   }
 
-  const lines = relevant.map((d) => {
-    const severity = d.severity === DiagnosticSeverity.Error ? "error" : "warning";
-    const line = d.range.start.line + 1;
-    const col = d.range.start.character + 1;
-    const source = d.source ? `[${d.source}] ` : "";
-    return `  ${severity} ${line}:${col} ${source}${d.message}`;
-  });
+  const sourceLines = documentContent?.split(/\r?\n/u);
+  const lines = relevant.flatMap((diagnostic, index) =>
+    formatDiagnostic(
+      filePath,
+      diagnostic,
+      cwd,
+      index < MAX_SOURCE_EXCERPTS
+        ? sourceExcerpt(sourceLines, diagnostic.range.start.line)
+        : undefined,
+    )
+  );
 
   let errorCount = 0;
   for (const d of allRelevant) {
@@ -68,11 +141,12 @@ function otherFilesFooter(result: DiagnosticResult, cwd?: string): string {
       f.errorCount > 0 ? `${f.errorCount} error${f.errorCount > 1 ? "s" : ""}` : "",
       f.warningCount > 0 ? `${f.warningCount} warning${f.warningCount > 1 ? "s" : ""}` : "",
     ].filter(Boolean).join(", ");
-    if (!f.firstDiagnostic) return `  ${path} (${counts})`;
-    const d = f.firstDiagnostic;
-    const sev = d.severity === DiagnosticSeverity.Error ? "error" : "warning";
-    const src = d.source ? `[${d.source}] ` : "";
-    return `  ${path} (${counts}): ${sev} ${d.line + 1}:${d.col + 1} ${src}${d.message}`;
+    const diagnostics = f.topDiagnostics.slice(0, 3);
+    const header = `  ${path} (${counts})${diagnostics.length > 0 ? ":" : ""}`;
+    const diagnosticLines = diagnostics.flatMap((diagnostic) =>
+      formatDiagnostic(path, diagnostic, cwd)
+    );
+    return [header, ...diagnosticLines].join("\n");
   });
   return `\n${lines.join("\n")}`;
 }

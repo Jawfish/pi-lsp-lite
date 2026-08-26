@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createServerManager } from "./src/server-manager.js";
 import { languageForFile, checkExtensionOverlaps, builtinLanguages, type LanguageServerConfig } from "./src/languages.js";
-import { formatDiagnostics } from "./src/format.js";
+import { formatDiagnostic, formatDiagnostics } from "./src/format.js";
 import { DiagnosticSeverity } from "vscode-languageserver-protocol";
 import { loadConfig, writeGlobalConfig, readGlobalConfig } from "./src/config.js";
 import { fileUri, which, isInsideCwd } from "./src/util.js";
@@ -65,7 +65,7 @@ export default function (pi: ExtensionAPI) {
 
     try {
       const result = await manager.handleEdit(absolutePath, langConfig, ctx.cwd);
-      const formatted = formatDiagnostics(filePath, result, ctx.cwd);
+      const formatted = formatDiagnostics(filePath, result, ctx.cwd, result.documentContent);
       if (!formatted) return;
 
       ctx.ui.notify(formatted.trim(), "warning");
@@ -113,12 +113,8 @@ export default function (pi: ExtensionAPI) {
         const relevant = diags.filter((d) => d.severity === DiagnosticSeverity.Error || d.severity === DiagnosticSeverity.Warning);
         if (relevant.length === 0) continue;
         lines.push(`${filePath} (${relevant.length} diagnostic${relevant.length !== 1 ? "s" : ""})`);
-        for (const d of relevant) {
-          const severity = d.severity === DiagnosticSeverity.Error ? "error" : "warning";
-          const line = d.range.start.line + 1;
-          const col = d.range.start.character + 1;
-          const source = d.source ? `[${d.source}] ` : "";
-          lines.push(`  ${severity} ${line}:${col} ${source}${d.message}`);
+        for (const diagnostic of relevant) {
+          lines.push(...formatDiagnostic(filePath, diagnostic, ctx.cwd));
         }
       }
 

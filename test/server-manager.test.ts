@@ -56,6 +56,7 @@ describe("ServerManager", () => {
 
     const result1 = await manager.handleEdit(filePath, fakeConfig, dir);
     assert.equal(result1.status, "ok");
+    assert.equal(result1.documentContent, "package main");
 
     const status1 = manager.status();
     assert.equal(status1.length, 1);
@@ -63,6 +64,7 @@ describe("ServerManager", () => {
     await writeFile(filePath, "package main\n");
     const result2 = await manager.handleEdit(filePath, fakeConfig, dir);
     assert.equal(result2.status, "ok");
+    assert.equal(result2.documentContent, "package main\n");
 
     const status2 = manager.status();
     assert.equal(status2.length, 1);
