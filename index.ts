@@ -3,6 +3,11 @@ import {
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { createServerManager } from "./src/server-manager.js";
+import {
+  createWorkingMessageController,
+  type ValidationProgress,
+  type WorkingMessageController,
+} from "./src/progress.js";
 import { languageForFile, checkExtensionOverlaps, builtinLanguages, type LanguageServerConfig } from "./src/languages.js";
 import { formatDiagnostic, formatDiagnostics } from "./src/format.js";
 import { DiagnosticSeverity } from "vscode-languageserver-protocol";
@@ -44,6 +49,8 @@ export default function (pi: ExtensionAPI) {
   let currentConfig: ResolvedConfig | null = null;
   let reloadTail: Promise<unknown> = Promise.resolve();
   let configWatcher: ConfigWatchHandle | null = null;
+  let workingMessageController: WorkingMessageController | null = null;
+  let validationProgressHandler: ((event: ValidationProgress) => void) | null = null;
   const pendingNewFiles = new Map<string, boolean>();
   const pendingBashSnapshots = new Map<string, BashChangeSnapshot>();
 
@@ -63,6 +70,7 @@ export default function (pi: ExtensionAPI) {
       documentIdleTimeout: config.documentIdleTimeout,
       perServerTimeout: config.perServerTimeout,
       softDeadline: config.softDeadline,
+      onValidationProgress: (event) => validationProgressHandler?.(event),
     });
   }
 
@@ -105,6 +113,14 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    workingMessageController?.reset();
+    workingMessageController = ctx.hasUI
+      ? createWorkingMessageController((message) =>
+        ctx.ui.setWorkingMessage(message)
+      )
+      : null;
+    validationProgressHandler = workingMessageController?.handle ?? null;
+
     await reloadConfig(ctx.cwd);
     configWatcher?.close();
     configWatcher = watchConfigFiles({
@@ -283,6 +299,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     configWatcher?.close();
     configWatcher = null;
+    validationProgressHandler = null;
+    workingMessageController?.reset();
+    workingMessageController = null;
     pendingNewFiles.clear();
     pendingBashSnapshots.clear();
     await reloadTail;

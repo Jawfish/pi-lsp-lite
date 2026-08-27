@@ -27,6 +27,7 @@ import {
   raceWithAbort,
 } from "./abort.js";
 import type { ChangeDetectionTarget } from "./change-detection.js";
+import type { ValidationProgress } from "./progress.js";
 
 export interface EditDiagnosticResult extends DiagnosticResult {
   delta: DiagnosticDelta;
@@ -109,6 +110,7 @@ export interface ServerManagerOptions {
   perServerTimeout?: Map<string, number>;
   maxRetries?: number;
   softDeadline?: number;
+  onValidationProgress?: (event: ValidationProgress) => void;
 }
 
 const RETRY_BASE_DELAY_MS = 500;
@@ -185,6 +187,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
   const perServerTimeout = options.perServerTimeout ?? new Map();
   const defaultMaxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
   const softDeadline = options.softDeadline ?? DEFAULT_SOFT_DEADLINE;
+  const onValidationProgress = options.onValidationProgress;
   const servers = new Map<string, ManagedServer>();
   const pending = new Map<string, PendingServer>();
   const disabledBinaries = new Set<string>();
@@ -402,6 +405,36 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     return Math.max(0, Math.min(10, Math.floor(raw)));
   }
 
+  function reportValidationProgress(event: ValidationProgress): void {
+    try {
+      onValidationProgress?.(event);
+    } catch (error) {
+      console.error("[pi-lsp-lite] validation progress callback failed:", error);
+    }
+  }
+
+  async function waitForDiagnosticAttempt(
+    server: ManagedServer,
+    uri: string,
+    timeout: number,
+    signal: AbortSignal | undefined,
+    attempt: number,
+    totalAttempts: number,
+  ): Promise<DiagnosticResult> {
+    const progress = {
+      serverId: server.config.id,
+      root: server.root,
+      attempt,
+      totalAttempts,
+    };
+    reportValidationProgress({ phase: "start", ...progress });
+    try {
+      return await server.client.waitForDiagnostics(uri, timeout, signal);
+    } finally {
+      reportValidationProgress({ phase: "end", ...progress });
+    }
+  }
+
   function withDelta(
     result: DiagnosticResult,
     progress: EditProgress,
@@ -476,7 +509,14 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     };
 
     let lastResult = accumulateOtherFiles(
-      await server.client.waitForDiagnostics(uri, timeout, signal),
+      await waitForDiagnosticAttempt(
+        server,
+        uri,
+        timeout,
+        signal,
+        1,
+        retries + 1,
+      ),
     );
 
     for (
@@ -494,7 +534,14 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       server.client.didChange(uri, content);
       server.openDocuments.set(uri, Date.now());
       const result = accumulateOtherFiles(
-        await server.client.waitForDiagnostics(uri, timeout, signal),
+        await waitForDiagnosticAttempt(
+          server,
+          uri,
+          timeout,
+          signal,
+          attempt + 2,
+          retries + 1,
+        ),
       );
       result.retryAttempts = attempt + 1;
 
