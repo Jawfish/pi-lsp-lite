@@ -18,6 +18,10 @@ import {
   formatConfigChange,
   type ConfigChange,
 } from "./src/config-reload.js";
+import {
+  watchConfigFiles,
+  type ConfigWatchHandle,
+} from "./src/config-watch.js";
 import { fileUri, which, isInsideCwd } from "./src/util.js";
 import { installRegistry, installCommandFor } from "./src/install-registry.js";
 import { buildServerStates, formatServerStates } from "./src/status.js";
@@ -39,6 +43,7 @@ export default function (pi: ExtensionAPI) {
   let manager = createServerManager({});
   let currentConfig: ResolvedConfig | null = null;
   let reloadTail: Promise<unknown> = Promise.resolve();
+  let configWatcher: ConfigWatchHandle | null = null;
   const pendingNewFiles = new Map<string, boolean>();
   const pendingBashSnapshots = new Map<string, BashChangeSnapshot>();
 
@@ -101,6 +106,17 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     await reloadConfig(ctx.cwd);
+    configWatcher?.close();
+    configWatcher = watchConfigFiles({
+      cwd: ctx.cwd,
+      onChange: async () => {
+        const change = await reloadConfig(ctx.cwd);
+        if (change.changed && ctx.hasUI) {
+          ctx.ui.notify(formatConfigChange(change), "info");
+        }
+      },
+      onError: (error) => console.error("[pi-lsp-lite] config watcher:", error),
+    });
   });
 
   pi.on("tool_call", async (event, ctx) => {
@@ -265,9 +281,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    configWatcher?.close();
+    configWatcher = null;
     pendingNewFiles.clear();
     pendingBashSnapshots.clear();
+    await reloadTail;
     await manager.shutdownAll();
+    currentConfig = null;
+    servers = [];
   });
 
   pi.registerCommand("lsp-reload", {
