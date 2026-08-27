@@ -6,7 +6,18 @@ import { createServerManager } from "./src/server-manager.js";
 import { languageForFile, checkExtensionOverlaps, builtinLanguages, type LanguageServerConfig } from "./src/languages.js";
 import { formatDiagnostic, formatDiagnostics } from "./src/format.js";
 import { DiagnosticSeverity } from "vscode-languageserver-protocol";
-import { loadConfig, writeGlobalConfig, readGlobalConfig } from "./src/config.js";
+import {
+  loadConfig,
+  writeGlobalConfig,
+  readGlobalConfig,
+  type ResolvedConfig,
+} from "./src/config.js";
+import {
+  applyResolvedConfig,
+  compareResolvedConfigs,
+  formatConfigChange,
+  type ConfigChange,
+} from "./src/config-reload.js";
 import { fileUri, which, isInsideCwd } from "./src/util.js";
 import { installRegistry, installCommandFor } from "./src/install-registry.js";
 import { buildServerStates, formatServerStates } from "./src/status.js";
@@ -26,6 +37,8 @@ import {
 export default function (pi: ExtensionAPI) {
   let servers: LanguageServerConfig[] = [];
   let manager = createServerManager({});
+  let currentConfig: ResolvedConfig | null = null;
+  let reloadTail: Promise<unknown> = Promise.resolve();
   const pendingNewFiles = new Map<string, boolean>();
   const pendingBashSnapshots = new Map<string, BashChangeSnapshot>();
 
@@ -39,21 +52,40 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  async function initConfig(cwd: string) {
-    pendingBashSnapshots.clear();
-    await manager.shutdownAll();
-    const resolved = await loadConfig(cwd);
-    servers = resolved.servers;
-    manager = createServerManager({
-      diagnosticTimeout: resolved.diagnosticTimeout,
-      documentIdleTimeout: resolved.documentIdleTimeout,
-      perServerTimeout: resolved.perServerTimeout,
-      softDeadline: resolved.softDeadline,
+  function createConfiguredManager(config: ResolvedConfig) {
+    return createServerManager({
+      diagnosticTimeout: config.diagnosticTimeout,
+      documentIdleTimeout: config.documentIdleTimeout,
+      perServerTimeout: config.perServerTimeout,
+      softDeadline: config.softDeadline,
     });
+  }
+
+  async function reloadConfigNow(cwd: string): Promise<ConfigChange> {
+    const resolved = await loadConfig(cwd);
+    const change = compareResolvedConfigs(currentConfig, resolved);
+    if (!change.changed) return change;
+
+    pendingBashSnapshots.clear();
+    const applied = await applyResolvedConfig(
+      { config: currentConfig, manager },
+      resolved,
+      createConfiguredManager,
+    );
+    currentConfig = applied.runtime.config;
+    manager = applied.runtime.manager;
+    servers = resolved.servers;
 
     for (const warning of checkExtensionOverlaps(servers)) {
       console.error(`[pi-lsp-lite] ${warning}`);
     }
+    return applied.change;
+  }
+
+  function reloadConfig(cwd: string): Promise<ConfigChange> {
+    const operation = reloadTail.then(() => reloadConfigNow(cwd));
+    reloadTail = operation.catch(() => {});
+    return operation;
   }
 
   async function currentServerStates() {
@@ -68,7 +100,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
-    await initConfig(ctx.cwd);
+    await reloadConfig(ctx.cwd);
   });
 
   pi.on("tool_call", async (event, ctx) => {
@@ -238,6 +270,14 @@ export default function (pi: ExtensionAPI) {
     await manager.shutdownAll();
   });
 
+  pi.registerCommand("lsp-reload", {
+    description: "Reload LSP configuration",
+    handler: async (_args, ctx) => {
+      const change = await reloadConfig(ctx.cwd);
+      ctx.ui.notify(formatConfigChange(change), "info");
+    },
+  });
+
   pi.registerCommand("lsp-status", {
     description: "Show configured LSP servers, install state, and running processes",
     handler: async (_args, ctx) => {
@@ -324,7 +364,7 @@ export default function (pi: ExtensionAPI) {
 
       const resolved = await which(command);
       await writeGlobalConfig({ servers: { [id]: { command, args, extensions, rootPatterns } } });
-      await initConfig(ctx.cwd);
+      await reloadConfig(ctx.cwd);
 
       if (!resolved) {
         ctx.ui.notify(`pi-lsp-lite: configured server "${id}", but "${command}" is missing from PATH — install it manually before use`, "warning");
@@ -355,7 +395,7 @@ export default function (pi: ExtensionAPI) {
       if (!confirmed) return;
 
       await writeGlobalConfig({ servers: { [selected]: { disabled: true } } });
-      await initConfig(ctx.cwd);
+      await reloadConfig(ctx.cwd);
       ctx.ui.notify(`pi-lsp-lite: disabled server "${selected}"`, "info");
     },
   });
@@ -400,7 +440,7 @@ export default function (pi: ExtensionAPI) {
         await writeGlobalConfig({ servers: { [id]: { disabled: false } } });
       }
 
-      await initConfig(ctx.cwd);
+      await reloadConfig(ctx.cwd);
 
       if (isCurrentlyEnabled) {
         ctx.ui.notify(`pi-lsp-lite: disabled server "${id}"`, "info");
@@ -462,7 +502,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      await initConfig(ctx.cwd);
+      await reloadConfig(ctx.cwd);
       ctx.ui.notify(`pi-lsp-lite: installed ${selected.id}`, "info");
     },
   });
