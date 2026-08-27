@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { createServerManager } from "../../src/server-manager.js";
 import { builtinLanguages as languages } from "../../src/languages.js";
 import { pollUntil } from "../poll-until.js";
-import { handleInitial } from "../server-manager-helpers.js";
+import { handleFinal } from "../server-manager-helpers.js";
 
 const pyConfig = languages.find((l) => l.id === "python");
 if (!pyConfig) throw new Error("python config not found in languages");
@@ -23,7 +23,7 @@ describe("pylsp integration", { skip: !process.env.INTEGRATION }, () => {
 
     // warmup
     await writeFile(join(dir, "warmup.py"), "x = 1\n");
-    const warmup = await handleInitial(manager, join(dir, "warmup.py"), pyConfig, dir);
+    const warmup = await handleFinal(manager, join(dir, "warmup.py"), pyConfig, dir);
     assert.notEqual(warmup.status, "unavailable", "pylsp is not available — cannot run integration tests");
   });
 
@@ -37,7 +37,7 @@ describe("pylsp integration", { skip: !process.env.INTEGRATION }, () => {
     await writeFile(filePath, "def broken(:\n");
 
     const result = await pollUntil(
-      () => handleInitial(manager, filePath, pyConfig, dir),
+      () => handleFinal(manager, filePath, pyConfig, dir),
       (r) => r.diagnostics.some((d) => d.severity === 1),
     );
 
@@ -46,7 +46,7 @@ describe("pylsp integration", { skip: !process.env.INTEGRATION }, () => {
 
     // fix so it doesn't pollute subsequent tests
     await writeFile(filePath, "def fixed():\n    pass\n");
-    await handleInitial(manager, filePath, pyConfig, dir);
+    await handleFinal(manager, filePath, pyConfig, dir);
   });
 
   it("reports no errors for clean file", async () => {
@@ -54,7 +54,7 @@ describe("pylsp integration", { skip: !process.env.INTEGRATION }, () => {
     await writeFile(filePath, "def greet(name: str) -> str:\n    return f'hello {name}'\n");
 
     const result = await pollUntil(
-      () => handleInitial(manager, filePath, pyConfig, dir),
+      () => handleFinal(manager, filePath, pyConfig, dir),
       (r) => !r.diagnostics.some((d) => d.severity === 1),
     );
 
