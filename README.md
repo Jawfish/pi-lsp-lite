@@ -52,6 +52,7 @@ Agent `bash` diagnostics append to the tool result when ready before the soft de
 | Command        | What it does                                                            |
 | -------------- | ----------------------------------------------------------------------- |
 | `/lsp-status`  | Show running servers, PIDs, workspace roots, uptime                     |
+| `/lsp-reload`  | Reload config now and report what changed                               |
 | `/lsp-diag`    | Show all current diagnostics (or `/lsp-diag path/to/file` for one file) |
 | `/lsp-add`     | Interactively add a new language server                                 |
 | `/lsp-remove`  | Disable a configured server                                             |
@@ -97,6 +98,8 @@ Works without config. Use project config (`.pi-lsp-lite.json` or `.pi/lsp-lite.j
 | `softDeadline`                   | Maximum blocking wait (ms)       | `10000`      |
 
 Project config merges over global for safe tuning fields. Repositories can disable servers and tune timeouts, retries, and the soft deadline, but they cannot change the executable, argv, extensions, or root patterns for any existing server; put those trusted changes in global config. `softDeadline` is clamped from 1000 to 60000 ms.
+
+The extension watches all three config files and applies edits after a 300 ms debounce. It restarts language servers only when the resolved config changes. Whitespace and unknown keys do not cause a restart. Use `/lsp-reload` to check and apply config on demand.
 
 ## How it works
 

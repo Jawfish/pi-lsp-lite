@@ -10,6 +10,8 @@ pi-lsp-lite is a [pi extension](https://github.com/mariozechner/pi) that checks 
 index.ts               → extension entry point
 src/
   config.ts            → config file loading, merge, and write
+  config-reload.ts     → stable comparison and reload summaries
+  config-watch.ts      → debounced config file watchers
   languages.ts         → built-in language server defaults
   install-registry.ts  → known install commands for built-in servers
   client.ts            → LSP protocol client (JSON-RPC over stdio)
@@ -175,18 +177,22 @@ Each layer merges over the previous:
 - Timeout overrides (`diagnosticTimeout`, `documentIdleTimeout`) cascade from global to per-server
 - Timeout values are clamped to safe bounds
 
-Config is not hot-reloaded — `/reload` picks up changes via `session_start`.
+`config-reload.ts` converts each resolved config to stable JSON before comparison. The conversion sorts map and object keys but keeps array order. An equivalent config keeps the current manager and its running servers. A changed config shuts down the manager, creates one with the new settings, and reports added, removed, or retuned server counts. `/lsp-reload` runs this path on demand. The add, remove, toggle, and install commands use the same serialized path.
+
+`config-watch.ts` watches the parent directories of `~/.pi-lsp-lite.json`, `.pi-lsp-lite.json`, and `.pi/lsp-lite.json`. Parent watches detect file creation and deletion. A watch on the session directory also detects creation or replacement of `.pi` and refreshes its watcher. Events use a 300 ms debounce. Automatic reloads notify only when the resolved config changed.
+
+Watchers start after config loading in `session_start`. `session_shutdown` closes them, cancels pending debounce work, waits for a reload already in progress, and then stops the manager. A new session starts with no resolved config, so it creates a new manager.
 
 ## Extension hooks used
 
-| Hook               | Purpose                                                                                          |
-| ------------------ | ------------------------------------------------------------------------------------------------ |
-| `tool_call`        | Record new writes and capture tracked files before agent bash                                    |
-| `tool_result`      | Append write/edit diagnostics and resync files after agent bash                                  |
-| `user_bash`        | Wrap local `!` execution, then resync and queue diagnostics                                      |
-| `session_start`    | Load config and create the server manager                                                        |
-| `session_shutdown` | Clear snapshots and kill all servers                                                             |
-| `registerCommand`  | Provide `/lsp-status`, `/lsp-diag`, `/lsp-add`, `/lsp-remove`, `/lsp-toggle`, and `/lsp-install` |
+| Hook               | Purpose                                                                                                         |
+| ------------------ | --------------------------------------------------------------------------------------------------------------- |
+| `tool_call`        | Record new writes and capture tracked files before agent bash                                                   |
+| `tool_result`      | Append write/edit diagnostics and resync files after agent bash                                                 |
+| `user_bash`        | Wrap local `!` execution, then resync and queue diagnostics                                                     |
+| `session_start`    | Load config, create the server manager, and start config watchers                                               |
+| `session_shutdown` | Close config watchers, clear snapshots, and kill all servers                                                    |
+| `registerCommand`  | Provide `/lsp-reload`, `/lsp-status`, `/lsp-diag`, `/lsp-add`, `/lsp-remove`, `/lsp-toggle`, and `/lsp-install` |
 
 ## Adding a language
 
