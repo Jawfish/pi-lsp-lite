@@ -39,6 +39,7 @@ import { lstat, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { isAbortError } from "./src/abort.js";
 import { deliverLateDiagnostics } from "./src/late-delivery.js";
+import { diagnosticNotification } from "./src/notifications.js";
 import {
   captureBashChangeSnapshot,
   prepareBashDiagnostics,
@@ -56,6 +57,7 @@ export default function (pi: ExtensionAPI) {
   let workingMessageController: WorkingMessageController | null = null;
   let validationProgressHandler: ((event: ValidationProgress) => void) | null = null;
   let statusSetter: ((text: string | undefined) => void) | null = null;
+  let configWarningNotifier: ((warning: string) => void) | null = null;
   const pendingNewFiles = new Map<string, boolean>();
   const pendingBashSnapshots = new Map<string, BashChangeSnapshot>();
 
@@ -106,7 +108,7 @@ export default function (pi: ExtensionAPI) {
     refreshFooterStatus();
 
     for (const warning of checkExtensionOverlaps(servers)) {
-      console.error(`[pi-lsp-lite] ${warning}`);
+      configWarningNotifier?.(warning);
     }
     return applied.change;
   }
@@ -133,6 +135,9 @@ export default function (pi: ExtensionAPI) {
     statusSetter?.(undefined);
     statusSetter = ctx.hasUI
       ? (text) => ctx.ui.setStatus("lsp", text)
+      : null;
+    configWarningNotifier = ctx.hasUI
+      ? (warning) => ctx.ui.notify(`pi-lsp-lite: ${warning}`, "warning")
       : null;
     workingMessageController = ctx.hasUI
       ? createWorkingMessageController((message) =>
@@ -212,7 +217,6 @@ export default function (pi: ExtensionAPI) {
         }
         if (!prepared.content) return;
 
-        if (ctx.hasUI) ctx.ui.notify(prepared.content.trim(), "warning");
         return {
           content: [
             ...event.content,
@@ -267,7 +271,10 @@ export default function (pi: ExtensionAPI) {
       const formatted = formatDiagnostics(filePath, result, ctx.cwd, result.documentContent);
       if (!formatted) return;
 
-      ctx.ui.notify(formatted.trim(), "warning");
+      const notification = diagnosticNotification(result.status, formatted);
+      if (notification && ctx.hasUI) {
+        ctx.ui.notify(notification.message, notification.type);
+      }
 
       return {
         content: [...event.content, { type: "text" as const, text: formatted }],
@@ -325,6 +332,7 @@ export default function (pi: ExtensionAPI) {
     workingMessageController = null;
     statusSetter?.(undefined);
     statusSetter = null;
+    configWarningNotifier = null;
     pendingNewFiles.clear();
     pendingBashSnapshots.clear();
     await reloadTail;
