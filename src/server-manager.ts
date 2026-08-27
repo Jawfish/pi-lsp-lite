@@ -8,7 +8,11 @@ import {
   type LspClient,
 } from "./client.js";
 import { type LanguageServerConfig, languageIdForFile } from "./languages.js";
-import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
+import {
+  DiagnosticSeverity,
+  type Diagnostic,
+  type FileEvent,
+} from "vscode-languageserver-protocol";
 import {
   DEFAULT_DIAGNOSTIC_TIMEOUT,
   DEFAULT_DOCUMENT_IDLE_TIMEOUT,
@@ -38,6 +42,10 @@ export interface EditDiagnosticOutcome {
 export interface HandleEditOptions {
   isNewFile?: boolean;
   signal?: AbortSignal;
+}
+
+export interface RoutedWatchedFileChange extends FileEvent {
+  serverKeys: string[];
 }
 
 interface ManagedServer {
@@ -77,6 +85,7 @@ export interface ServerManager {
   status(): ServerStatus[];
   snapshotTargets(): ChangeDetectionTarget[];
   closeDocument(filePath: string): void;
+  didChangeWatchedFiles(changes: RoutedWatchedFileChange[]): void;
   getAllDiagnostics(): Map<string, Diagnostic[]>;
   shutdownAll(): Promise<void>;
 }
@@ -635,6 +644,20 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         server.client.didClose(uri);
         server.openDocuments.delete(uri);
         resetIdleTimer(server);
+      }
+    },
+
+    didChangeWatchedFiles(changes: RoutedWatchedFileChange[]): void {
+      const changesByServer = new Map<string, FileEvent[]>();
+      for (const { serverKeys, uri, type } of changes) {
+        for (const serverKey of serverKeys) {
+          const serverChanges = changesByServer.get(serverKey) ?? [];
+          serverChanges.push({ uri, type });
+          changesByServer.set(serverKey, serverChanges);
+        }
+      }
+      for (const [serverKey, serverChanges] of changesByServer) {
+        servers.get(serverKey)?.client.didChangeWatchedFiles(serverChanges);
       }
     },
 

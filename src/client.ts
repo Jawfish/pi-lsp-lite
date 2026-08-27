@@ -10,6 +10,8 @@ import {
   ShutdownRequest,
   ExitNotification,
   PublishDiagnosticsNotification,
+  RegistrationRequest,
+  DidChangeWatchedFilesNotification,
   CancellationTokenSource,
   DiagnosticServerCancellationData,
   DiagnosticSeverity,
@@ -20,6 +22,7 @@ import {
   type InitializeParams,
   type Diagnostic,
   type DocumentDiagnosticReport,
+  type FileEvent,
 } from "vscode-languageserver-protocol/node";
 import type { ChildProcess } from "node:child_process";
 import { fileUri } from "./util.js";
@@ -61,6 +64,7 @@ export interface LspClient {
   didOpen(uri: string, languageId: string, content: string): void;
   didChange(uri: string, content: string): void;
   didClose(uri: string): void;
+  didChangeWatchedFiles(changes: FileEvent[]): boolean;
   waitForDiagnostics(
     uri: string,
     timeoutMs: number,
@@ -156,6 +160,7 @@ export function createLspClient(child: ChildProcess): LspClient {
   const lastDocumentVersion = new Map<string, number>();
   const closedDocuments = new Set<string>();
   const uriGeneration = new Map<string, number>();
+  const watchedFileRegistrations = new Set<string>();
   let pullDiagnosticSupport: PullDiagnosticSupport | undefined;
   let crossFileCallback: ((changedUri: string) => void) | null = null;
 
@@ -402,6 +407,14 @@ export function createLspClient(child: ChildProcess): LspClient {
     };
   };
 
+  connection.onRequest(RegistrationRequest.type, (params) => {
+    for (const registration of params.registrations) {
+      if (registration.method === DidChangeWatchedFilesNotification.method) {
+        watchedFileRegistrations.add(registration.id);
+      }
+    }
+  });
+
   connection.onNotification(PublishDiagnosticsNotification.type, (params) => {
     if (closedDocuments.has(params.uri)) return;
     const currentVersion = documentVersion.get(params.uri);
@@ -460,6 +473,11 @@ export function createLspClient(child: ChildProcess): LspClient {
             diagnostic: {
               dynamicRegistration: false,
               relatedDocumentSupport: true,
+            },
+          },
+          workspace: {
+            didChangeWatchedFiles: {
+              dynamicRegistration: true,
             },
           },
         },
@@ -530,6 +548,16 @@ export function createLspClient(child: ChildProcess): LspClient {
       });
       diagnosticsMap.delete(uri);
       documentVersion.delete(uri);
+    },
+
+    didChangeWatchedFiles(changes: FileEvent[]): boolean {
+      if (watchedFileRegistrations.size === 0 || changes.length === 0) {
+        return false;
+      }
+      connection.sendNotification(DidChangeWatchedFilesNotification.type, {
+        changes,
+      });
+      return true;
     },
 
     async waitForDiagnostics(

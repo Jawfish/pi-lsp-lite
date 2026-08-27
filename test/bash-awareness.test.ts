@@ -1,10 +1,15 @@
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  DiagnosticSeverity,
+  FileChangeType,
+  type Diagnostic,
+  type FileEvent,
+} from "vscode-languageserver-protocol";
 import {
   captureBashChangeSnapshot,
   prepareBashDiagnostics,
@@ -53,7 +58,10 @@ function diagnostic(message: string): Diagnostic {
   };
 }
 
-function fakeConfig(delay = 0): LanguageServerConfig {
+function fakeConfig(
+  delay = 0,
+  watchedFilesLogPath?: string,
+): LanguageServerConfig {
   const diagnosticsByText = {
     "clean\n": [],
     "broken\n": [diagnostic("bash error")],
@@ -65,11 +73,37 @@ function fakeConfig(delay = 0): LanguageServerConfig {
     args: [
       fakeServerPath,
       "--run",
-      `--options=${JSON.stringify({ diagnosticDelay: delay, diagnosticsByText })}`,
+      `--options=${JSON.stringify({
+        diagnosticDelay: delay,
+        diagnosticsByText,
+        ...(watchedFilesLogPath
+          ? { registerWatchedFiles: true, watchedFilesLogPath }
+          : {}),
+      })}`,
     ],
     rootPatterns: ["go.mod"],
     maxRetries: 0,
   };
+}
+
+interface WatchedFilesLog {
+  registrationAcknowledged: boolean;
+  changes: FileEvent[];
+}
+
+async function waitForWatchedFilesLog(
+  path: string,
+  predicate: (log: WatchedFilesLog) => boolean,
+): Promise<WatchedFilesLog> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    try {
+      const log = JSON.parse(await readFile(path, "utf-8")) as WatchedFilesLog;
+      if (predicate(log)) return log;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`timed out waiting for watched-file log ${path}`);
 }
 
 async function openCleanDocument(
@@ -149,6 +183,52 @@ describe("bash change awareness", () => {
     assert.deepEqual(result.validations, []);
     assert.equal(manager.snapshotTargets()[0]?.documentUris.length, 0);
     assert.equal(manager.getAllDiagnostics().size, 0);
+  });
+
+  it("routes watched-file changes only after server registration", async () => {
+    const root = await makeTempDir();
+    const logPath = join(root, "watched-files.json");
+    const manager = createServerManager({ maxRetries: 0 });
+    managers.push(manager);
+    const config = fakeConfig(0, logPath);
+    config.rootPatterns.push("deleted.marker");
+    const filePath = await openCleanDocument(manager, config, root);
+    await writeFile(join(root, "deleted.marker"), "remove me\n");
+    await waitForWatchedFilesLog(
+      logPath,
+      (log) => log.registrationAcknowledged && log.changes.length === 0,
+    );
+    const before = await captureBashChangeSnapshot(manager);
+    assert.ok(before);
+
+    const goModPath = join(root, "go.mod");
+    const packagePath = join(root, "package.json");
+    const deletedMarkerPath = join(root, "deleted.marker");
+    await writeFile(filePath, "broken\n");
+    await writeFile(goModPath, "module changed.example\n");
+    await writeFile(packagePath, "{}\n");
+    await rm(deletedMarkerPath);
+    await resyncAfterBash({
+      before,
+      manager,
+      servers: [config],
+      cwd: root,
+    });
+
+    const log = await waitForWatchedFilesLog(
+      logPath,
+      (entry) => entry.changes.length === 4,
+    );
+    assert.equal(log.registrationAcknowledged, true);
+    assert.deepEqual(
+      new Map(log.changes.map((change) => [change.uri, change.type])),
+      new Map([
+        [pathToFileURL(filePath).href, FileChangeType.Changed],
+        [pathToFileURL(goModPath).href, FileChangeType.Changed],
+        [pathToFileURL(packagePath).href, FileChangeType.Created],
+        [pathToFileURL(deletedMarkerPath).href, FileChangeType.Deleted],
+      ]),
+    );
   });
 
   it("late-delivers a changed result after the soft deadline", async () => {

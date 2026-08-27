@@ -2,6 +2,7 @@ import type { LanguageServerConfig } from "./languages.js";
 import { languageForFile } from "./languages.js";
 import type {
   EditDiagnosticOutcome,
+  RoutedWatchedFileChange,
   ServerManager,
 } from "./server-manager.js";
 import {
@@ -16,6 +17,8 @@ import {
   deliverLateDiagnostics,
   type SendLspDiagnosticsMessage,
 } from "./late-delivery.js";
+import { FileChangeType } from "vscode-languageserver-protocol";
+import { fileUri } from "./util.js";
 
 export interface BashChangeSnapshot {
   targets: ChangeDetectionTarget[];
@@ -78,6 +81,22 @@ export async function resyncAfterBash({
   for (const entry of diff.deleted) {
     if (entry.kinds.includes("document")) manager.closeDocument(entry.path);
   }
+
+  const watchedFileChanges: RoutedWatchedFileChange[] = [
+    ...diff.changed.map<RoutedWatchedFileChange>((entry) => ({
+      serverKeys: entry.serverKeys,
+      uri: fileUri(entry.path),
+      type: before.files.get(entry.path)?.metadata
+        ? FileChangeType.Changed
+        : FileChangeType.Created,
+    })),
+    ...diff.deleted.map<RoutedWatchedFileChange>((entry) => ({
+      serverKeys: entry.serverKeys,
+      uri: fileUri(entry.path),
+      type: FileChangeType.Deleted,
+    })),
+  ];
+  manager.didChangeWatchedFiles(watchedFileChanges);
 
   const validations = await Promise.all(
     diff.changed
