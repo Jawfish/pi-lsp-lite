@@ -1,8 +1,13 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildServerStates, formatServerStates } from "../src/status.js";
+import {
+  buildServerStates,
+  formatServerStates,
+  formatStatusLine,
+} from "../src/status.js";
 import type { InstallEntry } from "../src/install-registry.js";
 import type { LanguageServerConfig } from "../src/languages.js";
+import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
 
 const builtinTs: LanguageServerConfig = {
   id: "typescript",
@@ -95,6 +100,39 @@ describe("buildServerStates", () => {
     assert.equal(typescript.enabled, false);
     assert.equal(typescript.command, "custom-typescript-language-server");
     assert.equal(typescript.installed, true);
+  });
+});
+
+describe("formatStatusLine", () => {
+  it("shows sorted server glyphs and diagnostic totals", () => {
+    const diagnostic = (severity: DiagnosticSeverity): Diagnostic => ({
+      range: {
+        start: { line: 0, character: 0 },
+        end: { line: 0, character: 1 },
+      },
+      severity,
+      message: "test",
+    });
+    const diagnostics = new Map([
+      ["file:///one.ts", [
+        diagnostic(DiagnosticSeverity.Error),
+        diagnostic(DiagnosticSeverity.Warning),
+        diagnostic(DiagnosticSeverity.Information),
+      ]],
+      ["file:///two.ts", [diagnostic(DiagnosticSeverity.Error)]],
+    ]);
+
+    const status = formatStatusLine([
+      { id: "rust", root: "/rust", state: "starting" },
+      { id: "go", root: "/go-one", state: "running" },
+      { id: "go", root: "/go-two", state: "running" },
+    ], diagnostics);
+
+    assert.equal(status, "lsp go✓ rust⏳ 2E/1W");
+  });
+
+  it("clears when no server is active", () => {
+    assert.equal(formatStatusLine([], new Map()), undefined);
   });
 });
 

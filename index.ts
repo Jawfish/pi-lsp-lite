@@ -29,7 +29,11 @@ import {
 } from "./src/config-watch.js";
 import { fileUri, which, isInsideCwd } from "./src/util.js";
 import { installRegistry, installCommandFor } from "./src/install-registry.js";
-import { buildServerStates, formatServerStates } from "./src/status.js";
+import {
+  buildServerStates,
+  formatServerStates,
+  formatStatusLine,
+} from "./src/status.js";
 import { resolve } from "node:path";
 import { lstat, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -51,6 +55,7 @@ export default function (pi: ExtensionAPI) {
   let configWatcher: ConfigWatchHandle | null = null;
   let workingMessageController: WorkingMessageController | null = null;
   let validationProgressHandler: ((event: ValidationProgress) => void) | null = null;
+  let statusSetter: ((text: string | undefined) => void) | null = null;
   const pendingNewFiles = new Map<string, boolean>();
   const pendingBashSnapshots = new Map<string, BashChangeSnapshot>();
 
@@ -64,13 +69,23 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
+  function refreshFooterStatus(): void {
+    statusSetter?.(
+      formatStatusLine(manager.activity(), manager.getAllDiagnostics()),
+    );
+  }
+
   function createConfiguredManager(config: ResolvedConfig) {
     return createServerManager({
       diagnosticTimeout: config.diagnosticTimeout,
       documentIdleTimeout: config.documentIdleTimeout,
       perServerTimeout: config.perServerTimeout,
       softDeadline: config.softDeadline,
-      onValidationProgress: (event) => validationProgressHandler?.(event),
+      onValidationProgress: (event) => {
+        validationProgressHandler?.(event);
+        if (event.phase === "end") refreshFooterStatus();
+      },
+      onServerStateChange: refreshFooterStatus,
     });
   }
 
@@ -88,6 +103,7 @@ export default function (pi: ExtensionAPI) {
     currentConfig = applied.runtime.config;
     manager = applied.runtime.manager;
     servers = resolved.servers;
+    refreshFooterStatus();
 
     for (const warning of checkExtensionOverlaps(servers)) {
       console.error(`[pi-lsp-lite] ${warning}`);
@@ -114,6 +130,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     workingMessageController?.reset();
+    statusSetter?.(undefined);
+    statusSetter = ctx.hasUI
+      ? (text) => ctx.ui.setStatus("lsp", text)
+      : null;
     workingMessageController = ctx.hasUI
       ? createWorkingMessageController((message) =>
         ctx.ui.setWorkingMessage(message)
@@ -122,6 +142,7 @@ export default function (pi: ExtensionAPI) {
     validationProgressHandler = workingMessageController?.handle ?? null;
 
     await reloadConfig(ctx.cwd);
+    refreshFooterStatus();
     configWatcher?.close();
     configWatcher = watchConfigFiles({
       cwd: ctx.cwd,
@@ -302,6 +323,8 @@ export default function (pi: ExtensionAPI) {
     validationProgressHandler = null;
     workingMessageController?.reset();
     workingMessageController = null;
+    statusSetter?.(undefined);
+    statusSetter = null;
     pendingNewFiles.clear();
     pendingBashSnapshots.clear();
     await reloadTail;

@@ -134,7 +134,15 @@ describe("Diagnostic delta", () => {
 
 describe("ServerManager", () => {
   it("first edit spawns server, second reuses it", async () => {
-    const manager = createServerManager();
+    const activitySnapshots: string[][] = [];
+    let manager: ReturnType<typeof createServerManager>;
+    manager = createServerManager({
+      onServerStateChange: () => {
+        activitySnapshots.push(
+          manager.activity().map(({ id, state }) => `${id}:${state}`),
+        );
+      },
+    });
     const dir = await makeTempDir();
     await writeFile(join(dir, "go.mod"), "module test");
     const filePath = join(dir, "main.go");
@@ -165,6 +173,13 @@ describe("ServerManager", () => {
     assert.equal(status2[0].pid, status1[0].pid);
 
     await manager.shutdownAll();
+    assert.ok(
+      activitySnapshots.some((activity) => activity.includes("fake:starting")),
+    );
+    assert.ok(
+      activitySnapshots.some((activity) => activity.includes("fake:running")),
+    );
+    assert.deepEqual(activitySnapshots.at(-1), []);
   });
 
   it("skips the first baseline and uses zero for a newly created file", async () => {

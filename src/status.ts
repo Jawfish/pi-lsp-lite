@@ -1,7 +1,8 @@
 import type { UserConfig } from "./config.js";
 import type { InstallEntry } from "./install-registry.js";
 import type { LanguageServerConfig } from "./languages.js";
-import type { ServerStatus } from "./server-manager.js";
+import type { ServerActivity, ServerStatus } from "./server-manager.js";
+import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
 
 export interface ServerState {
   id: string;
@@ -71,6 +72,33 @@ export async function buildServerStates(options: BuildServerStatesOptions): Prom
   }));
 
   return states;
+}
+
+export function formatStatusLine(
+  activity: ServerActivity[],
+  diagnostics: ReadonlyMap<string, Diagnostic[]>,
+): string | undefined {
+  if (activity.length === 0) return undefined;
+
+  const states = new Map<string, ServerActivity["state"]>();
+  for (const server of activity) {
+    const current = states.get(server.id);
+    if (current !== "starting") states.set(server.id, server.state);
+  }
+  const servers = [...states]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([id, state]) => `${id}${state === "starting" ? "⏳" : "✓"}`);
+
+  let errors = 0;
+  let warnings = 0;
+  for (const entries of diagnostics.values()) {
+    for (const diagnostic of entries) {
+      if (diagnostic.severity === DiagnosticSeverity.Error) errors++;
+      if (diagnostic.severity === DiagnosticSeverity.Warning) warnings++;
+    }
+  }
+
+  return `lsp ${servers.join(" ")} ${errors}E/${warnings}W`;
 }
 
 export function formatServerStates(states: ServerState[]): string {

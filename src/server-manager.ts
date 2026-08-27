@@ -63,8 +63,10 @@ interface ManagedServer {
 }
 
 interface PendingServer {
+  config: LanguageServerConfig;
   controller: AbortController;
   promise: Promise<ManagedServer | null>;
+  root: string;
   waiters: number;
 }
 
@@ -84,6 +86,7 @@ export interface ServerManager {
     options?: HandleEditOptions,
   ): Promise<EditDiagnosticOutcome>;
   status(): ServerStatus[];
+  activity(): ServerActivity[];
   snapshotTargets(): ChangeDetectionTarget[];
   closeDocument(filePath: string): void;
   didChangeWatchedFiles(changes: RoutedWatchedFileChange[]): void;
@@ -100,6 +103,12 @@ export interface ServerStatus {
   lastActivity: number;
 }
 
+export interface ServerActivity {
+  id: string;
+  root: string;
+  state: "starting" | "running";
+}
+
 const IDLE_TIMEOUT_MS = 240_000;
 const INIT_TIMEOUT_MS = 10_000;
 const SWEEP_INTERVAL_MS = 60_000;
@@ -111,6 +120,7 @@ export interface ServerManagerOptions {
   maxRetries?: number;
   softDeadline?: number;
   onValidationProgress?: (event: ValidationProgress) => void;
+  onServerStateChange?: () => void;
 }
 
 const RETRY_BASE_DELAY_MS = 500;
@@ -188,6 +198,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
   const defaultMaxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
   const softDeadline = options.softDeadline ?? DEFAULT_SOFT_DEADLINE;
   const onValidationProgress = options.onValidationProgress;
+  const onServerStateChange = options.onServerStateChange;
   const servers = new Map<string, ManagedServer>();
   const pending = new Map<string, PendingServer>();
   const disabledBinaries = new Set<string>();
@@ -195,6 +206,14 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
   const activeEdits = new Map<string, { controller: AbortController }>();
   const shutdownController = new AbortController();
   let sweepTimer: ReturnType<typeof setInterval> | null = null;
+
+  function reportServerStateChange(): void {
+    try {
+      onServerStateChange?.();
+    } catch (error) {
+      console.error("[pi-lsp-lite] server state callback failed:", error);
+    }
+  }
 
   function startSweepTimer() {
     if (sweepTimer) return;
@@ -249,6 +268,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     await killProcess(server.process);
     if (servers.get(server.serverKey) === server) {
       servers.delete(server.serverKey);
+      reportServerStateChange();
     }
     if (servers.size === 0) stopSweepTimer();
   }
@@ -335,12 +355,14 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       if (server.idleTimer) clearTimeout(server.idleTimer);
       if (servers.get(serverKey) === server) {
         servers.delete(serverKey);
+        reportServerStateChange();
       }
       if (servers.size === 0) stopSweepTimer();
     });
 
     resetIdleTimer(server);
     servers.set(serverKey, server);
+    reportServerStateChange();
     startSweepTimer();
     return server;
   }
@@ -370,8 +392,10 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         shutdownController.signal,
       ]);
       const pendingServer: PendingServer = {
+        config,
         controller,
         promise: Promise.resolve(null),
+        root,
         waiters: 0,
       };
       pendingServer.promise = spawnServer(
@@ -382,9 +406,11 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       ).finally(() => {
         if (pending.get(serverKey) === pendingServer) {
           pending.delete(serverKey);
+          reportServerStateChange();
         }
       });
       pending.set(serverKey, pendingServer);
+      reportServerStateChange();
       inflight = pendingServer;
     }
 
@@ -669,6 +695,25 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         openDocuments: s.openDocuments.size,
         lastActivity: s.lastActivity,
       }));
+    },
+
+    activity(): ServerActivity[] {
+      const activity: ServerActivity[] = Array.from(servers.values()).map(
+        (server) => ({
+          id: server.config.id,
+          root: server.root,
+          state: "running",
+        }),
+      );
+      for (const [serverKey, server] of pending) {
+        if (servers.has(serverKey)) continue;
+        activity.push({
+          id: server.config.id,
+          root: server.root,
+          state: "starting",
+        });
+      }
+      return activity;
     },
 
     snapshotTargets(): ChangeDetectionTarget[] {
