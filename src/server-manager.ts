@@ -22,6 +22,7 @@ import {
   isAbortError,
   raceWithAbort,
 } from "./abort.js";
+import type { ChangeDetectionTarget } from "./change-detection.js";
 
 export interface EditDiagnosticResult extends DiagnosticResult {
   delta: DiagnosticDelta;
@@ -74,6 +75,7 @@ export interface ServerManager {
     options?: HandleEditOptions,
   ): Promise<EditDiagnosticOutcome>;
   status(): ServerStatus[];
+  snapshotTargets(): ChangeDetectionTarget[];
   getAllDiagnostics(): Map<string, Diagnostic[]>;
   shutdownAll(): Promise<void>;
 }
@@ -609,6 +611,15 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         uptime: Date.now() - s.startTime,
         openDocuments: s.openDocuments.size,
         lastActivity: s.lastActivity,
+      }));
+    },
+
+    snapshotTargets(): ChangeDetectionTarget[] {
+      return Array.from(servers.values()).map((server) => ({
+        serverKey: server.serverKey,
+        root: server.root,
+        rootPatterns: [...server.config.rootPatterns],
+        documentUris: [...server.openDocuments.keys()],
       }));
     },
 
