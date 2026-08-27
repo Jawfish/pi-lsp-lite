@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { handleInitial } from "./server-manager-helpers.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -58,6 +59,29 @@ function makeDiagnostic(message: string, line = 0): Diagnostic {
     source: "fake",
     code: "FAKE1001",
   };
+}
+
+async function waitForServerStart(
+  manager: ReturnType<typeof createServerManager>,
+): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (manager.status().length === 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(manager.status().length > 0, "server should start");
+}
+
+async function waitForOpenDocument(
+  manager: ReturnType<typeof createServerManager>,
+): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (
+    manager.status()[0]?.openDocuments !== 1 &&
+    Date.now() < deadline
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(manager.status()[0]?.openDocuments, 1, "document should open");
 }
 
 describe("Diagnostic delta", () => {
@@ -115,7 +139,7 @@ describe("ServerManager", () => {
     const filePath = join(dir, "main.go");
     await writeFile(filePath, "package main");
 
-    const result1 = await manager.handleEdit(filePath, fakeConfig, dir);
+    const result1 = await handleInitial(manager, filePath, fakeConfig, dir);
     assert.equal(result1.status, "ok");
     assert.equal(result1.documentContent, "package main");
 
@@ -123,7 +147,7 @@ describe("ServerManager", () => {
     assert.equal(status1.length, 1);
 
     await writeFile(filePath, "package main\n");
-    const result2 = await manager.handleEdit(filePath, fakeConfig, dir);
+    const result2 = await handleInitial(manager, filePath, fakeConfig, dir);
     assert.equal(result2.status, "ok");
     assert.equal(result2.documentContent, "package main\n");
 
@@ -143,17 +167,17 @@ describe("ServerManager", () => {
     await writeFile(existingPath, "package main");
     await writeFile(newPath, "package main");
 
-    const first = await manager.handleEdit(existingPath, fakeConfig, dir);
+    const first = await handleInitial(manager, existingPath, fakeConfig, dir);
     assert.deepEqual(first.delta, { hasBaseline: false });
 
-    const second = await manager.handleEdit(existingPath, fakeConfig, dir);
+    const second = await handleInitial(manager, existingPath, fakeConfig, dir);
     assert.equal(second.delta.hasBaseline, true);
     if (second.delta.hasBaseline) {
       assert.equal(second.delta.diagnostics[0]?.classification, "pre-existing");
       assert.equal(second.delta.fixedCount, 0);
     }
 
-    const created = await manager.handleEdit(newPath, fakeConfig, dir, {
+    const created = await handleInitial(manager, newPath, fakeConfig, dir, {
       isNewFile: true,
     });
     assert.equal(created.delta.hasBaseline, true);
@@ -175,8 +199,8 @@ describe("ServerManager", () => {
     await writeFile(file2, "package main");
 
     const [r1, r2] = await Promise.all([
-      manager.handleEdit(file1, fakeConfig, dir),
-      manager.handleEdit(file2, fakeConfig, dir),
+      handleInitial(manager, file1, fakeConfig, dir),
+      handleInitial(manager, file2, fakeConfig, dir),
     ]);
 
     assert.equal(r1.status, "ok");
@@ -194,11 +218,11 @@ describe("ServerManager", () => {
     const filePath = join(dir, "main.xyz");
     await writeFile(filePath, "content");
 
-    const result1 = await manager.handleEdit(filePath, missingConfig, dir);
+    const result1 = await handleInitial(manager, filePath, missingConfig, dir);
     assert.equal(result1.status, "unavailable");
     assert.equal(result1.diagnostics.length, 0);
 
-    const result2 = await manager.handleEdit(filePath, missingConfig, dir);
+    const result2 = await handleInitial(manager, filePath, missingConfig, dir);
     assert.equal(result2.status, "unavailable");
     assert.equal(result2.diagnostics.length, 0);
 
@@ -224,8 +248,8 @@ describe("ServerManager", () => {
     await writeFile(file1, "package main");
     await writeFile(file2, "package main");
 
-    await manager.handleEdit(file1, fakeConfig, dir);
-    await manager.handleEdit(file2, fakeConfig, dir);
+    await handleInitial(manager, file1, fakeConfig, dir);
+    await handleInitial(manager, file2, fakeConfig, dir);
 
     const status = manager.status();
     assert.equal(status.length, 2);
@@ -256,13 +280,14 @@ describe("ServerManager", () => {
     await writeFile(fileA, "package main");
     await writeFile(fileB, "package main");
 
-    // root A crashes on init
-    const resultA = await manager.handleEdit(fileA, crashConfig, dir);
+    // root A crashes on init; its failure can finish just after the soft deadline
+    const outcomeA = await manager.handleEdit(fileA, crashConfig, dir);
+    const resultA = (await outcomeA.pending) ?? outcomeA.initial;
     assert.equal(resultA.status, "unavailable");
     assert.equal(resultA.diagnostics.length, 0);
 
     // root B should still work with a working config
-    const resultB = await manager.handleEdit(fileB, fakeConfig, dir);
+    const resultB = await handleInitial(manager, fileB, fakeConfig, dir);
     assert.equal(resultB.status, "ok");
     assert.ok(resultB.diagnostics.length > 0, "root B should produce diagnostics");
 
@@ -276,7 +301,7 @@ describe("ServerManager", () => {
     const filePath = join(dir, "main.go");
     await writeFile(filePath, "package main");
 
-    await manager.handleEdit(filePath, fakeConfig, dir);
+    await handleInitial(manager, filePath, fakeConfig, dir);
     assert.equal(manager.status().length, 1);
 
     await manager.shutdownAll();
@@ -297,7 +322,7 @@ describe("ServerManager", () => {
     const filePath = join(dir, "main.go");
     await writeFile(filePath, "package main");
 
-    await manager.handleEdit(filePath, neverShutdownConfig, dir);
+    await handleInitial(manager, filePath, neverShutdownConfig, dir);
     assert.equal(manager.status().length, 1);
 
     const start = Date.now();
@@ -306,6 +331,404 @@ describe("ServerManager", () => {
 
     assert.equal(manager.status().length, 0);
     assert.ok(elapsed < 15_000, `shutdownAll took ${elapsed}ms, expected < 15s`);
+  });
+});
+
+describe("Abort handling", () => {
+  it("rejects a pre-aborted edit without starting a server", async () => {
+    const manager = createServerManager();
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package main");
+    const controller = new AbortController();
+    controller.abort();
+
+    await assert.rejects(
+      handleInitial(manager, filePath, fakeConfig, dir, { signal: controller.signal }),
+      (error: Error) => error.name === "AbortError",
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(manager.status().length, 0);
+
+    await manager.shutdownAll();
+  });
+
+  it("aborts retry backoff and skips remaining attempts", async () => {
+    const retryConfig: LanguageServerConfig = {
+      id: "fake-abort-retry",
+      extensions: [".go"],
+      command: tsxPath,
+      args: [fakeServerPath, "--run", '--options={"publishOnAttempt":2}'],
+      rootPatterns: ["go.mod"],
+    };
+    const manager = createServerManager({ diagnosticTimeout: 100, maxRetries: 3 });
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package main");
+    const controller = new AbortController();
+
+    const pending = handleInitial(manager, filePath, retryConfig, dir, {
+      signal: controller.signal,
+    });
+    await waitForServerStart(manager);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const abortTime = Date.now();
+    controller.abort();
+
+    await assert.rejects(pending, (error: Error) => error.name === "AbortError");
+    assert.ok(Date.now() - abortTime < 250, "backoff should abort promptly");
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    assert.equal(manager.getAllDiagnostics().size, 0, "abort should prevent the retry");
+
+    await manager.shutdownAll();
+  });
+
+  it("caller abort cancels an unshared server startup", async () => {
+    const slowInitConfig: LanguageServerConfig = {
+      id: "fake-abort-caller-init",
+      extensions: [".go"],
+      command: tsxPath,
+      args: [fakeServerPath, "--run", '--options={"initializeDelay":2000}'],
+      rootPatterns: ["go.mod"],
+    };
+    const recoveredConfig: LanguageServerConfig = {
+      ...slowInitConfig,
+      args: [fakeServerPath, "--run"],
+    };
+    const manager = createServerManager();
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package main");
+    const controller = new AbortController();
+
+    const pending = handleInitial(manager, filePath, slowInitConfig, dir, {
+      signal: controller.signal,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    controller.abort();
+    await assert.rejects(pending, (error: Error) => error.name === "AbortError");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(manager.status().length, 0);
+
+    const recovered = await handleInitial(manager, filePath, recoveredConfig, dir);
+    assert.equal(recovered.status, "ok");
+    await manager.shutdownAll();
+  });
+
+  it("shutdown drains a server that is still initializing", async () => {
+    const slowInitConfig: LanguageServerConfig = {
+      id: "fake-abort-init",
+      extensions: [".go"],
+      command: tsxPath,
+      args: [fakeServerPath, "--run", '--options={"initializeDelay":2000}'],
+      rootPatterns: ["go.mod"],
+    };
+    const manager = createServerManager();
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package main");
+
+    const pending = handleInitial(manager, filePath, slowInitConfig, dir);
+    const rejection = assert.rejects(
+      pending,
+      (error: Error) => error.name === "AbortError",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await manager.shutdownAll();
+    await rejection;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    assert.equal(manager.status().length, 0);
+  });
+
+  it("shutdown aborts validation before server teardown", async () => {
+    const neverPublishConfig: LanguageServerConfig = {
+      id: "fake-abort-shutdown",
+      extensions: [".go"],
+      command: tsxPath,
+      args: [fakeServerPath, "--run", '--options={"neverPublish":true}'],
+      rootPatterns: ["go.mod"],
+    };
+    const manager = createServerManager({ diagnosticTimeout: 10_000 });
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package main");
+
+    const pending = handleInitial(manager, filePath, neverPublishConfig, dir);
+    const rejection = assert.rejects(
+      pending,
+      (error: Error) => error.name === "AbortError",
+    );
+    await waitForServerStart(manager);
+    const start = Date.now();
+    await manager.shutdownAll();
+    await rejection;
+
+    assert.ok(Date.now() - start < 1_000, "shutdown should not wait for diagnostics");
+    assert.equal(manager.status().length, 0);
+  });
+});
+
+describe("Soft deadline", () => {
+  it("returns an initial result before a cold slow server completes", async () => {
+    const slowConfig: LanguageServerConfig = {
+      id: "fake-soft-deadline",
+      extensions: [".go"],
+      command: tsxPath,
+      args: [fakeServerPath, "--run", '--options={"initializeDelay":750}'],
+      rootPatterns: ["go.mod"],
+    };
+    const manager = createServerManager({
+      diagnosticTimeout: 2_000,
+      maxRetries: 0,
+      softDeadline: 100,
+    });
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package main");
+
+    const start = Date.now();
+    const outcome = await manager.handleEdit(filePath, slowConfig, dir);
+    const elapsed = Date.now() - start;
+
+    assert.ok(elapsed < 400, `initial result took ${elapsed}ms`);
+    assert.equal(outcome.initial.status, "timeout");
+    assert.ok(outcome.pending);
+    const final = await outcome.pending;
+    assert.equal(final?.status, "ok");
+    assert.equal(final?.diagnostics[0]?.message, "fake error");
+
+    await manager.shutdownAll();
+  });
+
+  it("resolves pending to null when the initial result is complete", async () => {
+    const manager = createServerManager({ softDeadline: 2_000 });
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package main");
+
+    const outcome = await manager.handleEdit(filePath, fakeConfig, dir);
+
+    assert.equal(outcome.initial.status, "ok");
+    assert.ok(outcome.pending);
+    assert.equal(await outcome.pending, null);
+
+    await manager.shutdownAll();
+  });
+
+  it("keeps full background validations serialized per server", async () => {
+    const slowConfig: LanguageServerConfig = {
+      id: "fake-soft-queue",
+      extensions: [".go"],
+      command: tsxPath,
+      args: [fakeServerPath, "--run", '--options={"diagnosticDelay":300}'],
+      rootPatterns: ["go.mod"],
+    };
+    const manager = createServerManager({
+      diagnosticTimeout: 2_000,
+      maxRetries: 0,
+      softDeadline: 50,
+    });
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const warmPath = join(dir, "warm.go");
+    const firstPath = join(dir, "first.go");
+    const secondPath = join(dir, "second.go");
+    await writeFile(warmPath, "package main");
+    await writeFile(firstPath, "package main");
+    await writeFile(secondPath, "package main");
+
+    const warm = await manager.handleEdit(warmPath, slowConfig, dir);
+    assert.ok(warm.pending);
+    await warm.pending;
+
+    const first = await manager.handleEdit(firstPath, slowConfig, dir);
+    const secondStart = Date.now();
+    const second = await manager.handleEdit(secondPath, slowConfig, dir);
+    const secondInitialElapsed = Date.now() - secondStart;
+    assert.equal(first.initial.status, "timeout");
+    assert.equal(second.initial.status, "timeout");
+    assert.ok(
+      secondInitialElapsed < 200,
+      `queued initial result took ${secondInitialElapsed}ms`,
+    );
+    assert.ok(first.pending);
+    assert.ok(second.pending);
+
+    let firstFinished = 0;
+    let secondFinished = 0;
+    const [firstFinal, secondFinal] = await Promise.all([
+      first.pending.then((result) => {
+        firstFinished = Date.now();
+        return result;
+      }),
+      second.pending.then((result) => {
+        secondFinished = Date.now();
+        return result;
+      }),
+    ]);
+
+    assert.equal(firstFinal?.status, "ok");
+    assert.equal(secondFinal?.status, "ok");
+    assert.ok(
+      Math.abs(secondFinished - firstFinished) >= 300,
+      "background validations should finish serially",
+    );
+
+    await manager.shutdownAll();
+  });
+
+  it("continues retries on the pending promise", async () => {
+    const retryConfig: LanguageServerConfig = {
+      id: "fake-soft-retry",
+      extensions: [".go"],
+      command: tsxPath,
+      args: [fakeServerPath, "--run", '--options={"publishOnAttempt":2}'],
+      rootPatterns: ["go.mod"],
+    };
+    const manager = createServerManager({
+      diagnosticTimeout: 100,
+      maxRetries: 1,
+      softDeadline: 50,
+    });
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package main");
+
+    const outcome = await manager.handleEdit(filePath, retryConfig, dir);
+    assert.equal(outcome.initial.status, "timeout");
+    assert.ok(outcome.pending);
+    const final = await outcome.pending;
+    assert.equal(final?.status, "ok");
+    assert.equal(final?.retryAttempts, 1);
+
+    await manager.shutdownAll();
+  });
+
+  it("keeps abort rejection on pending validation", async () => {
+    const neverPublishConfig: LanguageServerConfig = {
+      id: "fake-soft-abort",
+      extensions: [".go"],
+      command: tsxPath,
+      args: [fakeServerPath, "--run", '--options={"neverPublish":true}'],
+      rootPatterns: ["go.mod"],
+    };
+    const manager = createServerManager({
+      diagnosticTimeout: 10_000,
+      softDeadline: 50,
+    });
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package main");
+    const controller = new AbortController();
+
+    const outcome = await manager.handleEdit(filePath, neverPublishConfig, dir, {
+      signal: controller.signal,
+    });
+    assert.ok(outcome.pending);
+    const rejection = assert.rejects(
+      outcome.pending,
+      (error: Error) => error.name === "AbortError",
+    );
+    controller.abort();
+    await rejection;
+
+    await manager.shutdownAll();
+  });
+});
+
+describe("Burst coalescing", () => {
+  it("supersedes an in-flight edit and keeps only the newest state", async () => {
+    const options = JSON.stringify({
+      diagnosticDelay: 300,
+      diagnosticsByText: {
+        "package old": [makeDiagnostic("old error")],
+        "package new": [makeDiagnostic("new error")],
+      },
+    });
+    const burstConfig: LanguageServerConfig = {
+      id: "fake-burst",
+      extensions: [".go"],
+      command: tsxPath,
+      args: [fakeServerPath, "--run", `--options=${options}`],
+      rootPatterns: ["go.mod"],
+    };
+    const manager = createServerManager({
+      diagnosticTimeout: 2_000,
+      maxRetries: 0,
+      softDeadline: 1_000,
+    });
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package old");
+
+    const firstPending = manager.handleEdit(filePath, burstConfig, dir);
+    await waitForOpenDocument(manager);
+    await writeFile(filePath, "package new");
+    const supersededAt = Date.now();
+    const secondPending = manager.handleEdit(filePath, burstConfig, dir);
+    const first = await firstPending;
+
+    assert.equal(first.superseded, true);
+    assert.ok(Date.now() - supersededAt < 250, "older edit should settle promptly");
+    assert.equal(await first.pending, null);
+
+    const second = await secondPending;
+    assert.notEqual(second.superseded, true);
+    const final = (await second.pending) ?? second.initial;
+    assert.equal(final.diagnostics[0]?.message, "new error");
+    assert.equal(
+      manager.getAllDiagnostics().values().next().value?.[0]?.message,
+      "new error",
+    );
+
+    await manager.shutdownAll();
+  });
+
+  it("restarts cold server startup for the newest edit", async () => {
+    const options = JSON.stringify({
+      initializeDelay: 500,
+      diagnosticsByText: {
+        "package first": [makeDiagnostic("first error")],
+        "package latest": [makeDiagnostic("latest error")],
+      },
+    });
+    const burstConfig: LanguageServerConfig = {
+      id: "fake-cold-burst",
+      extensions: [".go"],
+      command: tsxPath,
+      args: [fakeServerPath, "--run", `--options=${options}`],
+      rootPatterns: ["go.mod"],
+    };
+    const manager = createServerManager({ softDeadline: 1_000 });
+    const dir = await makeTempDir();
+    await writeFile(join(dir, "go.mod"), "module test");
+    const filePath = join(dir, "main.go");
+    await writeFile(filePath, "package first");
+
+    const firstPending = manager.handleEdit(filePath, burstConfig, dir);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await writeFile(filePath, "package latest");
+    const secondPending = manager.handleEdit(filePath, burstConfig, dir);
+
+    const first = await firstPending;
+    assert.equal(first.superseded, true);
+    const second = await secondPending;
+    const final = (await second.pending) ?? second.initial;
+    assert.notEqual(final.status, "unavailable");
+    assert.equal(final.diagnostics[0]?.message, "latest error");
+
+    await manager.shutdownAll();
   });
 });
 
@@ -324,7 +747,7 @@ describe("ServerManagerOptions", () => {
     const filePath = join(dir, "main.go");
     await writeFile(filePath, "package main");
 
-    const result = await manager.handleEdit(filePath, slowConfig, dir);
+    const result = await handleInitial(manager, filePath, slowConfig, dir);
     assert.equal(result.status, "timeout");
 
     await manager.shutdownAll();
@@ -349,7 +772,7 @@ describe("ServerManagerOptions", () => {
     const filePath = join(dir, "main.go");
     await writeFile(filePath, "package main");
 
-    const result = await manager.handleEdit(filePath, slowConfig, dir);
+    const result = await handleInitial(manager, filePath, slowConfig, dir);
     assert.equal(result.status, "timeout");
 
     await manager.shutdownAll();
@@ -366,7 +789,7 @@ describe("ServerManagerOptions", () => {
     const filePath = join(dir, "main.go");
     await writeFile(filePath, "package main");
 
-    const result = await manager.handleEdit(filePath, fakeConfig, dir);
+    const result = await handleInitial(manager, filePath, fakeConfig, dir);
     assert.equal(result.status, "ok");
 
     await manager.shutdownAll();
@@ -381,7 +804,7 @@ describe("Retry logic", () => {
     const filePath = join(dir, "main.go");
     await writeFile(filePath, "package main");
 
-    const result = await manager.handleEdit(filePath, fakeConfig, dir);
+    const result = await handleInitial(manager, filePath, fakeConfig, dir);
     assert.equal(result.status, "ok");
     assert.equal(result.retryAttempts, 0);
     assert.ok(result.diagnostics.length > 0);
@@ -403,7 +826,7 @@ describe("Retry logic", () => {
     const filePath = join(dir, "main.go");
     await writeFile(filePath, "package main");
 
-    const result = await manager.handleEdit(filePath, publish3rdConfig, dir);
+    const result = await handleInitial(manager, filePath, publish3rdConfig, dir);
     assert.equal(result.status, "ok");
     assert.equal(result.retryAttempts, 2);
     assert.ok(result.diagnostics.length > 0);
@@ -425,12 +848,12 @@ describe("Retry logic", () => {
     const filePath = join(dir, "main.go");
     await writeFile(filePath, "package main");
 
-    const first = await manager.handleEdit(filePath, publishOnceConfig, dir);
+    const first = await handleInitial(manager, filePath, publishOnceConfig, dir);
     assert.equal(first.status, "ok");
 
     await writeFile(filePath, "package main\n");
     const start = Date.now();
-    const second = await manager.handleEdit(filePath, publishOnceConfig, dir);
+    const second = await handleInitial(manager, filePath, publishOnceConfig, dir);
     const elapsed = Date.now() - start;
 
     assert.equal(second.status, "timeout");
@@ -478,8 +901,8 @@ describe("Retry logic", () => {
     };
     const manager = createServerManager({ diagnosticTimeout: 100, maxRetries: 1 });
 
-    await manager.handleEdit(stalledPath, pullConfig, dir);
-    const result = await manager.handleEdit(filePath, pullConfig, dir);
+    await handleInitial(manager, stalledPath, pullConfig, dir);
+    const result = await handleInitial(manager, filePath, pullConfig, dir);
 
     assert.equal(result.status, "timeout");
     assert.equal(result.retryAttempts, 1);
@@ -503,7 +926,7 @@ describe("Retry logic", () => {
     const filePath = join(dir, "main.go");
     await writeFile(filePath, "package main");
 
-    const result = await manager.handleEdit(filePath, neverPublishConfig, dir);
+    const result = await handleInitial(manager, filePath, neverPublishConfig, dir);
     assert.equal(result.status, "timeout");
     assert.equal(result.retryAttempts, 3);
 
@@ -526,7 +949,7 @@ describe("Retry logic", () => {
     const filePath = join(dir, "main.go");
     await writeFile(filePath, "package main");
 
-    const result = await manager.handleEdit(filePath, publish2ndConfig, dir);
+    const result = await handleInitial(manager, filePath, publish2ndConfig, dir);
     assert.equal(result.status, "ok");
     assert.equal(result.retryAttempts, 1);
     assert.ok(result.diagnostics.length > 0);
@@ -549,7 +972,7 @@ describe("Retry logic", () => {
     await writeFile(filePath, "package main");
 
     const start = Date.now();
-    const result = await manager.handleEdit(filePath, neverPublishConfig, dir);
+    const result = await handleInitial(manager, filePath, neverPublishConfig, dir);
     const elapsed = Date.now() - start;
 
     assert.equal(result.status, "timeout");

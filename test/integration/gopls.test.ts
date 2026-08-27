@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { createServerManager } from "../../src/server-manager.js";
 import { builtinLanguages as languages } from "../../src/languages.js";
 import { pollUntil } from "../poll-until.js";
+import { handleFinal } from "../server-manager-helpers.js";
 
 const goConfig = languages.find((l) => l.id === "go")!;
 
@@ -21,7 +22,7 @@ describe("gopls integration", { skip: !process.env.INTEGRATION }, () => {
 
     // warmup: absorb cold start
     await writeFile(join(dir, "warmup.go"), "package main\n");
-    const warmup = await manager.handleEdit(join(dir, "warmup.go"), goConfig, dir);
+    const warmup = await handleFinal(manager, join(dir, "warmup.go"), goConfig, dir);
     assert.notEqual(warmup.status, "unavailable", "gopls is not available — cannot run integration tests");
   });
 
@@ -35,7 +36,7 @@ describe("gopls integration", { skip: !process.env.INTEGRATION }, () => {
     await writeFile(filePath, "package main\n\nfunc main() {\n  fmt.Println(\n}\n");
 
     const result = await pollUntil(
-      () => manager.handleEdit(filePath, goConfig, dir),
+      () => handleFinal(manager, filePath, goConfig, dir),
       (r) => r.diagnostics.some((d) => d.severity === 1),
     );
 
@@ -44,7 +45,7 @@ describe("gopls integration", { skip: !process.env.INTEGRATION }, () => {
 
     // fix the error so it doesn't pollute subsequent tests
     await writeFile(filePath, "package main\n");
-    await manager.handleEdit(filePath, goConfig, dir);
+    await handleFinal(manager, filePath, goConfig, dir);
   });
 
   it("reports no errors for clean file", async () => {
@@ -52,7 +53,7 @@ describe("gopls integration", { skip: !process.env.INTEGRATION }, () => {
     await writeFile(filePath, 'package main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println("hello")\n}\n');
 
     const result = await pollUntil(
-      () => manager.handleEdit(filePath, goConfig, dir),
+      () => handleFinal(manager, filePath, goConfig, dir),
       (r) => !r.diagnostics.some((d) => d.severity === 1),
     );
 
@@ -71,8 +72,8 @@ describe("gopls integration", { skip: !process.env.INTEGRATION }, () => {
     );
 
     // open both files so gopls tracks them
-    await manager.handleEdit(join(dir, "caller.go"), goConfig, dir);
-    await manager.handleEdit(join(dir, "lib.go"), goConfig, dir);
+    await handleFinal(manager, join(dir, "caller.go"), goConfig, dir);
+    await handleFinal(manager, join(dir, "lib.go"), goConfig, dir);
 
     // break the signature
     await writeFile(
@@ -81,7 +82,7 @@ describe("gopls integration", { skip: !process.env.INTEGRATION }, () => {
     );
 
     const result = await pollUntil(
-      () => manager.handleEdit(join(dir, "lib.go"), goConfig, dir),
+      () => handleFinal(manager, join(dir, "lib.go"), goConfig, dir),
       (r) => {
         const totalDiags = r.diagnostics.filter((d) => d.severity === 1).length
           + r.otherFiles.reduce((s, f) => s + f.errorCount, 0);

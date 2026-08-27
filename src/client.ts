@@ -23,6 +23,7 @@ import {
 } from "vscode-languageserver-protocol/node";
 import type { ChildProcess } from "node:child_process";
 import { fileUri } from "./util.js";
+import { abortReason, abortableDelay, raceWithAbort } from "./abort.js";
 
 export interface OtherFileDiagnostics {
   uri: string;
@@ -60,7 +61,11 @@ export interface LspClient {
   didOpen(uri: string, languageId: string, content: string): void;
   didChange(uri: string, content: string): void;
   didClose(uri: string): void;
-  waitForDiagnostics(uri: string, timeoutMs: number): Promise<DiagnosticResult>;
+  waitForDiagnostics(
+    uri: string,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<DiagnosticResult>;
   getAllDiagnostics(): Map<string, Diagnostic[]>;
   shutdown(): Promise<void>;
 }
@@ -148,6 +153,8 @@ export function createLspClient(child: ChildProcess): LspClient {
 
   const diagnosticsMap = new Map<string, DiagnosticEntry>();
   const documentVersion = new Map<string, number>();
+  const lastDocumentVersion = new Map<string, number>();
+  const closedDocuments = new Set<string>();
   const uriGeneration = new Map<string, number>();
   let pullDiagnosticSupport: PullDiagnosticSupport | undefined;
   let crossFileCallback: ((changedUri: string) => void) | null = null;
@@ -249,7 +256,9 @@ export function createLspClient(child: ChildProcess): LspClient {
     targetUri: string,
     timeoutMs: number,
     support: PullDiagnosticSupport,
+    signal?: AbortSignal,
   ): Promise<DiagnosticResult> => {
+    signal?.throwIfAborted();
     const preSnapshot = diagnosticSnapshot(targetUri);
     const expectedGenerations = new Map(uriGeneration);
     const expectedPushRevisions = new Map(
@@ -262,6 +271,7 @@ export function createLspClient(child: ChildProcess): LspClient {
 
     const deadline = Date.now() + timeoutMs;
     const activeCancellations = new Set<CancellationTokenSource>();
+    const requestController = new AbortController();
     const requestReport = async (uri: string): Promise<DocumentDiagnosticReport | undefined> => {
       const generation = expectedGenerations.get(uri) ?? 0;
       while (
@@ -269,20 +279,28 @@ export function createLspClient(child: ChildProcess): LspClient {
         documentVersion.has(uri) &&
         (uriGeneration.get(uri) ?? 0) === generation
       ) {
+        signal?.throwIfAborted();
         const cancellation = new CancellationTokenSource();
         activeCancellations.add(cancellation);
         try {
           const previousResultId = diagnosticsMap.get(uri)?.resultId;
-          return await connection.sendRequest(
-            DocumentDiagnosticRequest.type,
-            {
-              textDocument: { uri },
-              ...(support.identifier ? { identifier: support.identifier } : {}),
-              ...(previousResultId ? { previousResultId } : {}),
-            },
-            cancellation.token,
+          return await raceWithAbort(
+            connection.sendRequest(
+              DocumentDiagnosticRequest.type,
+              {
+                textDocument: { uri },
+                ...(support.identifier ? { identifier: support.identifier } : {}),
+                ...(previousResultId ? { previousResultId } : {}),
+              },
+              cancellation.token,
+            ),
+            requestController.signal,
           );
         } catch (error) {
+          signal?.throwIfAborted();
+          if (requestController.signal.aborted) {
+            throw abortReason(requestController.signal);
+          }
           if (isRetriggerableCancellation(error)) continue;
           if (
             error instanceof ResponseError &&
@@ -296,10 +314,20 @@ export function createLspClient(child: ChildProcess): LspClient {
           cancellation.dispose();
         }
       }
+      signal?.throwIfAborted();
       return undefined;
     };
 
     let acceptingReports = true;
+    const cancelActiveRequests = (reason?: unknown) => {
+      acceptingReports = false;
+      if (!requestController.signal.aborted) {
+        requestController.abort(
+          reason ?? new DOMException("The diagnostic request stopped", "AbortError"),
+        );
+      }
+      for (const cancellation of activeCancellations) cancellation.cancel();
+    };
     const requests = uris.map(async (uri) => {
       try {
         const report = await requestReport(uri);
@@ -318,21 +346,33 @@ export function createLspClient(child: ChildProcess): LspClient {
     });
 
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
     let reports: Awaited<(typeof requests)[number]>[] | undefined;
     try {
+      const abort = new Promise<never>((_resolve, reject) => {
+        if (!signal) return;
+        onAbort = () => {
+          const reason = abortReason(signal);
+          cancelActiveRequests(reason);
+          reject(reason);
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) onAbort();
+      });
       reports = await Promise.race([
         Promise.all(requests),
         new Promise<undefined>((resolve) => {
           timeout = setTimeout(() => resolve(undefined), timeoutMs);
         }),
+        abort,
       ]);
     } finally {
       if (timeout) clearTimeout(timeout);
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
     }
 
     if (!reports) {
-      acceptingReports = false;
-      for (const cancellation of activeCancellations) cancellation.cancel();
+      cancelActiveRequests();
       return {
         status: "timeout",
         diagnostics: diagnosticsMap.get(targetUri)?.diagnostics ?? [],
@@ -341,8 +381,11 @@ export function createLspClient(child: ChildProcess): LspClient {
       };
     }
 
-    await new Promise((resolve) => setTimeout(resolve, QUIESCENCE_MS));
-    acceptingReports = false;
+    try {
+      await abortableDelay(QUIESCENCE_MS, signal);
+    } finally {
+      acceptingReports = false;
+    }
 
     const target = reports.find(({ uri }) => uri === targetUri);
     const nonRetryable = reports.some(
@@ -360,6 +403,14 @@ export function createLspClient(child: ChildProcess): LspClient {
   };
 
   connection.onNotification(PublishDiagnosticsNotification.type, (params) => {
+    if (closedDocuments.has(params.uri)) return;
+    const currentVersion = documentVersion.get(params.uri);
+    if (
+      params.version !== undefined &&
+      currentVersion !== undefined &&
+      params.version !== currentVersion
+    ) return;
+
     const entry = diagnosticsMap.get(params.uri);
     if (entry) {
       const currentGen = uriGeneration.get(params.uri) ?? 0;
@@ -428,8 +479,11 @@ export function createLspClient(child: ChildProcess): LspClient {
 
     didOpen(uri: string, languageId: string, content: string) {
       const gen = (uriGeneration.get(uri) ?? 0) + 1;
+      const version = (lastDocumentVersion.get(uri) ?? 0) + 1;
       uriGeneration.set(uri, gen);
-      documentVersion.set(uri, 1);
+      documentVersion.set(uri, version);
+      lastDocumentVersion.set(uri, version);
+      closedDocuments.delete(uri);
       diagnosticsMap.set(uri, {
         diagnostics: [],
         generation: gen,
@@ -440,16 +494,17 @@ export function createLspClient(child: ChildProcess): LspClient {
         validated: false,
       });
       connection.sendNotification(DidOpenTextDocumentNotification.type, {
-        textDocument: { uri, languageId, version: 1, text: content },
+        textDocument: { uri, languageId, version, text: content },
       });
     },
 
     didChange(uri: string, content: string) {
-      const version = (documentVersion.get(uri) ?? 1) + 1;
+      const version = (lastDocumentVersion.get(uri) ?? 0) + 1;
       const gen = (uriGeneration.get(uri) ?? 0) + 1;
       const previous = diagnosticsMap.get(uri);
       uriGeneration.set(uri, gen);
       documentVersion.set(uri, version);
+      lastDocumentVersion.set(uri, version);
       diagnosticsMap.set(uri, {
         diagnostics: previous?.diagnostics ?? [],
         generation: gen,
@@ -469,6 +524,7 @@ export function createLspClient(child: ChildProcess): LspClient {
     didClose(uri: string) {
       const gen = (uriGeneration.get(uri) ?? 0) + 1;
       uriGeneration.set(uri, gen);
+      closedDocuments.add(uri);
       connection.sendNotification(DidCloseTextDocumentNotification.type, {
         textDocument: { uri },
       });
@@ -476,23 +532,40 @@ export function createLspClient(child: ChildProcess): LspClient {
       documentVersion.delete(uri);
     },
 
-    async waitForDiagnostics(uri: string, timeoutMs: number): Promise<DiagnosticResult> {
+    async waitForDiagnostics(
+      uri: string,
+      timeoutMs: number,
+      signal?: AbortSignal,
+    ): Promise<DiagnosticResult> {
+      signal?.throwIfAborted();
       if (pullDiagnosticSupport) {
-        return pullDiagnostics(uri, timeoutMs, pullDiagnosticSupport);
+        return pullDiagnostics(uri, timeoutMs, pullDiagnosticSupport, signal);
       }
 
       const targetGen = uriGeneration.get(uri) ?? 0;
       const preSnapshot = diagnosticSnapshot(uri);
 
-      return new Promise<DiagnosticResult>((resolve) => {
+      return new Promise<DiagnosticResult>((resolve, reject) => {
         let settled = false;
         let quiescenceTimer: ReturnType<typeof setTimeout> | null = null;
+        let entryResolve: (() => void) | undefined;
+        let onCrossFile: ((changedUri: string) => void) | undefined;
+
+        const cleanup = () => {
+          clearTimeout(timeout);
+          if (quiescenceTimer) clearTimeout(quiescenceTimer);
+          signal?.removeEventListener("abort", onAbort);
+          const current = diagnosticsMap.get(uri);
+          if (current && current.resolve === entryResolve) {
+            current.resolve = undefined;
+          }
+          if (crossFileCallback === onCrossFile) crossFileCallback = null;
+        };
 
         const settle = (status: "ok" | "timeout") => {
           if (settled) return;
           settled = true;
-          crossFileCallback = null;
-          if (quiescenceTimer) clearTimeout(quiescenceTimer);
+          cleanup();
           resolve({
             status,
             diagnostics: diagnosticsMap.get(uri)?.diagnostics ?? [],
@@ -504,21 +577,20 @@ export function createLspClient(child: ChildProcess): LspClient {
           });
         };
 
+        const onAbort = () => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(abortReason(signal!));
+        };
+
         const resetQuiescence = () => {
           if (settled) return;
           if (quiescenceTimer) clearTimeout(quiescenceTimer);
           quiescenceTimer = setTimeout(() => settle("ok"), QUIESCENCE_MS);
         };
 
-        const timeout = setTimeout(() => {
-          const hasValidatedSnapshot = diagnosticsMap.get(uri)?.validated === true;
-          settle("timeout");
-          if (hasValidatedSnapshot) {
-            const current = diagnosticsMap.get(uri);
-            if (current) current.resolve = undefined;
-          }
-        }, timeoutMs);
-
+        const timeout = setTimeout(() => settle("timeout"), timeoutMs);
         const entry = diagnosticsMap.get(uri) ?? {
           diagnostics: [],
           generation: targetGen,
@@ -529,13 +601,14 @@ export function createLspClient(child: ChildProcess): LspClient {
           validated: false,
         };
 
-        entry.resolve = () => {
+        entryResolve = () => {
           clearTimeout(timeout);
           resetQuiescence();
         };
+        entry.resolve = entryResolve;
         diagnosticsMap.set(uri, entry);
 
-        crossFileCallback = (changedUri: string) => {
+        onCrossFile = (changedUri: string) => {
           if (settled || changedUri === uri) return;
           const preFp = preSnapshot.get(changedUri) ?? new Set<string>();
           const postFp = fingerprintSet(diagnosticsMap.get(changedUri)?.diagnostics ?? []);
@@ -544,8 +617,12 @@ export function createLspClient(child: ChildProcess): LspClient {
             resetQuiescence();
           }
         };
+        crossFileCallback = onCrossFile;
 
-        if (entry.received) {
+        signal?.addEventListener("abort", onAbort, { once: true });
+        if (signal?.aborted) {
+          onAbort();
+        } else if (entry.received) {
           clearTimeout(timeout);
           resetQuiescence();
         }

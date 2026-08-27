@@ -9,16 +9,34 @@ import {
 } from "./client.js";
 import { type LanguageServerConfig, languageIdForFile } from "./languages.js";
 import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
-import { DEFAULT_DIAGNOSTIC_TIMEOUT, DEFAULT_DOCUMENT_IDLE_TIMEOUT, DEFAULT_MAX_RETRIES } from "./config.js";
+import {
+  DEFAULT_DIAGNOSTIC_TIMEOUT,
+  DEFAULT_DOCUMENT_IDLE_TIMEOUT,
+  DEFAULT_MAX_RETRIES,
+  DEFAULT_SOFT_DEADLINE,
+} from "./config.js";
 import { readFile } from "node:fs/promises";
+import {
+  abortReason,
+  abortableDelay,
+  isAbortError,
+  raceWithAbort,
+} from "./abort.js";
 
 export interface EditDiagnosticResult extends DiagnosticResult {
   delta: DiagnosticDelta;
   documentContent?: string;
 }
 
+export interface EditDiagnosticOutcome {
+  initial: EditDiagnosticResult;
+  pending?: Promise<EditDiagnosticResult | null>;
+  superseded?: boolean;
+}
+
 export interface HandleEditOptions {
   isNewFile?: boolean;
+  signal?: AbortSignal;
 }
 
 interface ManagedServer {
@@ -31,7 +49,21 @@ interface ManagedServer {
   idleTimer: ReturnType<typeof setTimeout> | null;
   startTime: number;
   lastActivity: number;
-  editQueue: Promise<EditDiagnosticResult>;
+  editQueue: Promise<void>;
+}
+
+interface PendingServer {
+  controller: AbortController;
+  promise: Promise<ManagedServer | null>;
+  waiters: number;
+}
+
+interface EditProgress {
+  baseline?: Diagnostic[];
+  documentContent?: string;
+  latest?: DiagnosticResult;
+  server?: ManagedServer;
+  uri: string;
 }
 
 export interface ServerManager {
@@ -40,7 +72,7 @@ export interface ServerManager {
     config: LanguageServerConfig,
     cwd: string,
     options?: HandleEditOptions,
-  ): Promise<EditDiagnosticResult>;
+  ): Promise<EditDiagnosticOutcome>;
   status(): ServerStatus[];
   getAllDiagnostics(): Map<string, Diagnostic[]>;
   shutdownAll(): Promise<void>;
@@ -64,11 +96,23 @@ export interface ServerManagerOptions {
   documentIdleTimeout?: number;
   perServerTimeout?: Map<string, number>;
   maxRetries?: number;
+  softDeadline?: number;
 }
 
 const RETRY_BASE_DELAY_MS = 500;
 const MAX_RETRY_DELAY_MS = 30_000;
 const BENIGN_SERVER_STDERR = /^context cancel(?:l)?ed\.?$/iu;
+
+class SupersededEditError extends Error {
+  constructor() {
+    super("A newer edit superseded this validation");
+    this.name = "SupersededEditError";
+  }
+}
+
+function isSupersededEdit(error: unknown): error is SupersededEditError {
+  return error instanceof SupersededEditError;
+}
 
 function relevantDiagnostics(diagnostics: Diagnostic[]): Diagnostic[] {
   return diagnostics.filter(
@@ -128,10 +172,13 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
   const documentIdleTimeout = options.documentIdleTimeout ?? DEFAULT_DOCUMENT_IDLE_TIMEOUT;
   const perServerTimeout = options.perServerTimeout ?? new Map();
   const defaultMaxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
+  const softDeadline = options.softDeadline ?? DEFAULT_SOFT_DEADLINE;
   const servers = new Map<string, ManagedServer>();
-  const pending = new Map<string, Promise<ManagedServer | null>>();
+  const pending = new Map<string, PendingServer>();
   const disabledBinaries = new Set<string>();
   const failedRoots = new Set<string>();
+  const activeEdits = new Map<string, { controller: AbortController }>();
+  const shutdownController = new AbortController();
   let sweepTimer: ReturnType<typeof setInterval> | null = null;
 
   function startSweepTimer() {
@@ -191,9 +238,15 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     if (servers.size === 0) stopSweepTimer();
   }
 
-  async function spawnServer(config: LanguageServerConfig, root: string, serverKey: string): Promise<ManagedServer | null> {
+  async function spawnServer(
+    config: LanguageServerConfig,
+    root: string,
+    serverKey: string,
+    signal: AbortSignal,
+  ): Promise<ManagedServer | null> {
     if (disabledBinaries.has(config.id)) return null;
     if (failedRoots.has(serverKey)) return null;
+    if (signal.aborted) return null;
 
     const binaryPath = await which(config.command);
     if (!binaryPath) {
@@ -201,6 +254,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       disabledBinaries.add(config.id);
       return null;
     }
+    if (signal.aborted) return null;
 
     const child = spawn(binaryPath, config.args, {
       cwd: root,
@@ -226,14 +280,25 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     });
 
     try {
-      await Promise.race([client.initialize(root), timeoutPromise]);
+      await Promise.race([
+        raceWithAbort(client.initialize(root), signal),
+        timeoutPromise,
+      ]);
       clearTimeout(initTimer!);
     } catch (err) {
       clearTimeout(initTimer!);
-      console.error(`[pi-lsp-lite:${config.id}:${root}] failed to initialize:`, err);
+      if (!isAbortError(err)) {
+        console.error(`[pi-lsp-lite:${config.id}:${root}] failed to initialize:`, err);
+        failedRoots.add(serverKey);
+      }
       await killProcess(child);
       client.shutdown().catch(() => {});
-      failedRoots.add(serverKey);
+      return null;
+    }
+
+    if (signal.aborted) {
+      await killProcess(child);
+      client.shutdown().catch(() => {});
       return null;
     }
 
@@ -248,13 +313,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       idleTimer: null,
       startTime: now,
       lastActivity: now,
-      editQueue: Promise.resolve({
-        status: "ok",
-        diagnostics: [],
-        otherFiles: [],
-        retryAttempts: 0,
-        delta: { hasBaseline: false },
-      }),
+      editQueue: Promise.resolve(),
     };
 
     child.on("exit", () => {
@@ -271,7 +330,11 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     return server;
   }
 
-  async function ensureServer(config: LanguageServerConfig, root: string): Promise<ManagedServer | null> {
+  async function ensureServer(
+    config: LanguageServerConfig,
+    root: string,
+    signal: AbortSignal,
+  ): Promise<ManagedServer | null> {
     const serverKey = `${config.id}:${root}`;
     const existing = servers.get(serverKey);
     if (existing) return existing;
@@ -279,12 +342,46 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     if (disabledBinaries.has(config.id)) return null;
     if (failedRoots.has(serverKey)) return null;
 
-    const inflight = pending.get(serverKey);
-    if (inflight) return inflight;
+    let inflight = pending.get(serverKey);
+    if (inflight?.controller.signal.aborted) {
+      await raceWithAbort(inflight.promise, signal);
+      signal.throwIfAborted();
+      return ensureServer(config, root, signal);
+    }
+    if (!inflight) {
+      const controller = new AbortController();
+      const startupSignal = AbortSignal.any([
+        controller.signal,
+        shutdownController.signal,
+      ]);
+      const pendingServer: PendingServer = {
+        controller,
+        promise: Promise.resolve(null),
+        waiters: 0,
+      };
+      pendingServer.promise = spawnServer(
+        config,
+        root,
+        serverKey,
+        startupSignal,
+      ).finally(() => {
+        if (pending.get(serverKey) === pendingServer) {
+          pending.delete(serverKey);
+        }
+      });
+      pending.set(serverKey, pendingServer);
+      inflight = pendingServer;
+    }
 
-    const promise = spawnServer(config, root, serverKey).finally(() => pending.delete(serverKey));
-    pending.set(serverKey, promise);
-    return promise;
+    inflight.waiters++;
+    try {
+      return await raceWithAbort(inflight.promise, signal);
+    } finally {
+      inflight.waiters--;
+      if (inflight.waiters === 0 && pending.get(serverKey) === inflight) {
+        inflight.controller.abort();
+      }
+    }
   }
 
   function getMaxRetries(config: LanguageServerConfig): number {
@@ -293,20 +390,53 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     return Math.max(0, Math.min(10, Math.floor(raw)));
   }
 
+  function withDelta(
+    result: DiagnosticResult,
+    progress: EditProgress,
+  ): EditDiagnosticResult {
+    return {
+      ...result,
+      delta: progress.baseline === undefined
+        ? { hasBaseline: false }
+        : classifyDiagnostics(progress.baseline, result.diagnostics),
+      ...(progress.documentContent !== undefined
+        ? { documentContent: progress.documentContent }
+        : {}),
+    };
+  }
+
+  function partialResult(progress: EditProgress): EditDiagnosticResult {
+    const known = progress.latest ?? {
+      status: "timeout" as const,
+      diagnostics: progress.server?.client.getAllDiagnostics().get(progress.uri) ?? [],
+      otherFiles: [],
+      retryAttempts: 0,
+    };
+    return withDelta({ ...known, status: "timeout" }, progress);
+  }
+
   async function doEdit(
     server: ManagedServer,
     filePath: string,
     options: HandleEditOptions,
+    progress: EditProgress,
   ): Promise<EditDiagnosticResult> {
+    const signal = options.signal;
+    signal?.throwIfAborted();
     resetIdleTimer(server);
 
-    const uri = fileUri(filePath);
-    const baseline = options.isNewFile
+    progress.server = server;
+    const uri = progress.uri;
+    progress.baseline = options.isNewFile
       ? []
       : server.openDocuments.has(uri)
       ? server.client.getAllDiagnostics().get(uri) ?? []
       : undefined;
-    const content = await readFile(filePath, "utf-8");
+    const content = await readFile(filePath, {
+      encoding: "utf-8",
+      signal,
+    });
+    progress.documentContent = content;
     const timeout = perServerTimeout.get(server.config.id) ?? server.config.diagnosticTimeout ?? diagnosticTimeout;
     const retries = getMaxRetries(server.config);
 
@@ -325,18 +455,16 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       for (const otherFile of result.otherFiles) {
         accumulatedOtherFiles.set(otherFile.uri, otherFile);
       }
-      return { ...result, otherFiles: [...accumulatedOtherFiles.values()] };
+      const accumulated = {
+        ...result,
+        otherFiles: [...accumulatedOtherFiles.values()],
+      };
+      progress.latest = accumulated;
+      return accumulated;
     };
 
-    const withDelta = (result: DiagnosticResult): EditDiagnosticResult => ({
-      ...result,
-      delta: baseline === undefined
-        ? { hasBaseline: false }
-        : classifyDiagnostics(baseline, result.diagnostics),
-    });
-
     let lastResult = accumulateOtherFiles(
-      await server.client.waitForDiagnostics(uri, timeout),
+      await server.client.waitForDiagnostics(uri, timeout, signal),
     );
 
     for (
@@ -349,50 +477,128 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       resetIdleTimer(server);
       const baseDelay = Math.min(RETRY_BASE_DELAY_MS * 2 ** attempt, MAX_RETRY_DELAY_MS);
       const jitter = baseDelay * Math.random() * 0.5;
-      await new Promise((resolve) => setTimeout(resolve, baseDelay + jitter));
+      await abortableDelay(baseDelay + jitter, signal);
 
       server.client.didChange(uri, content);
       server.openDocuments.set(uri, Date.now());
       const result = accumulateOtherFiles(
-        await server.client.waitForDiagnostics(uri, timeout),
+        await server.client.waitForDiagnostics(uri, timeout, signal),
       );
       result.retryAttempts = attempt + 1;
 
       if (result.status === "ok") {
-        return { ...withDelta(result), documentContent: content };
+        return withDelta(result, progress);
       }
       lastResult = result;
     }
 
-    return { ...withDelta(lastResult), documentContent: content };
+    return withDelta(lastResult, progress);
   }
 
   return {
-    async handleEdit(
+    handleEdit(
       filePath: string,
       config: LanguageServerConfig,
       cwd: string,
       editOptions: HandleEditOptions = {},
-    ): Promise<EditDiagnosticResult> {
-      const root = await findWorkspaceRoot(filePath, config.rootPatterns, cwd);
-      const server = await ensureServer(config, root);
-      if (!server) {
-        return {
-          status: "unavailable" as const,
-          diagnostics: [],
-          otherFiles: [],
-          retryAttempts: 0,
-          delta: { hasBaseline: false },
-        };
+    ): Promise<EditDiagnosticOutcome> {
+      if (editOptions.signal?.aborted) {
+        return Promise.reject(abortReason(editOptions.signal));
+      }
+      if (shutdownController.signal.aborted) {
+        return Promise.reject(abortReason(shutdownController.signal));
       }
 
-      // serialize edits per server to avoid concurrent waitForDiagnostics races
-      const result = server.editQueue.then(
-        () => doEdit(server, filePath, editOptions),
-        () => doEdit(server, filePath, editOptions),
+      const uri = fileUri(filePath);
+      const operationState = { controller: new AbortController() };
+      const wasSuperseded = (error: unknown) =>
+        isSupersededEdit(error) ||
+        isSupersededEdit(operationState.controller.signal.reason);
+      const previous = activeEdits.get(uri);
+      activeEdits.set(uri, operationState);
+      previous?.controller.abort(new SupersededEditError());
+
+      const signal = AbortSignal.any([
+        shutdownController.signal,
+        operationState.controller.signal,
+        ...(editOptions.signal ? [editOptions.signal] : []),
+      ]);
+      const progress: EditProgress = { uri };
+      const operation = (async () => {
+        signal.throwIfAborted();
+        const root = await findWorkspaceRoot(filePath, config.rootPatterns, cwd);
+        signal.throwIfAborted();
+        const server = await ensureServer(config, root, signal);
+        signal.throwIfAborted();
+        if (!server) {
+          return {
+            status: "unavailable" as const,
+            diagnostics: [],
+            otherFiles: [],
+            retryAttempts: 0,
+            delta: { hasBaseline: false } as const,
+          };
+        }
+
+        // The queue follows full validation, not the soft-deadline result.
+        const result = server.editQueue.then(() =>
+          doEdit(server, filePath, { ...editOptions, signal }, progress)
+        );
+        server.editQueue = result.then(
+          () => undefined,
+          () => undefined,
+        );
+        return result;
+      })();
+      const cancellableOperation = raceWithAbort(operation, signal);
+      void cancellableOperation.then(
+        () => {
+          if (activeEdits.get(uri) === operationState) activeEdits.delete(uri);
+        },
+        () => {
+          if (activeEdits.get(uri) === operationState) activeEdits.delete(uri);
+        },
       );
-      server.editQueue = result;
-      return result;
+      const deadlineController = new AbortController();
+      const deadlineSignal = AbortSignal.any([
+        signal,
+        deadlineController.signal,
+      ]);
+      const completed = cancellableOperation.then((result) => ({
+        kind: "complete" as const,
+        result,
+      }));
+      const deadline = abortableDelay(softDeadline, deadlineSignal).then(() => ({
+        kind: "deadline" as const,
+      }));
+
+      return Promise.race([completed, deadline])
+        .then((winner) => {
+          if (winner.kind === "complete") {
+            return {
+              initial: winner.result,
+              pending: Promise.resolve(null),
+            };
+          }
+
+          const pending = cancellableOperation.catch((error: unknown) => {
+            if (wasSuperseded(error)) return null;
+            throw error;
+          });
+          return {
+            initial: partialResult(progress),
+            pending,
+          };
+        })
+        .finally(() => deadlineController.abort())
+        .catch((error: unknown) => {
+          if (!wasSuperseded(error)) throw error;
+          return {
+            initial: partialResult(progress),
+            pending: Promise.resolve(null),
+            superseded: true,
+          };
+        });
     },
 
     status(): ServerStatus[] {
@@ -417,9 +623,19 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     },
 
     async shutdownAll() {
+      shutdownController.abort();
       stopSweepTimer();
-      const shutdowns = Array.from(servers.values()).map((s) => shutdownServer(s));
+      await Promise.allSettled(
+        Array.from(pending.values()).map(({ promise }) => promise),
+      );
+      await Promise.allSettled(
+        Array.from(servers.values()).map((server) => server.editQueue),
+      );
+      const shutdowns = Array.from(servers.values()).map((server) =>
+        shutdownServer(server)
+      );
       await Promise.allSettled(shutdowns);
+      activeEdits.clear();
     },
   };
 }

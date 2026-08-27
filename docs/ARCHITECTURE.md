@@ -2,7 +2,7 @@
 
 ## Overview
 
-pi-lsp-lite is a [pi extension](https://github.com/mariozechner/pi) that hooks into the `tool_result` event for `write` and `edit` tool calls. When a supported file is modified, it routes the file through a long-lived LSP server and appends diagnostics to the tool result.
+pi-lsp-lite is a [pi extension](https://github.com/mariozechner/pi) that hooks into the `tool_result` event for `write` and `edit` tool calls. When a supported file is modified, it routes the file through a long-lived LSP server and appends diagnostics to the tool result. A soft deadline bounds this blocking append; changed results that finish later enter agent context as a custom message.
 
 ## Module layout
 
@@ -31,8 +31,10 @@ agent calls write/edit
   → index.ts: check file extension, resolve absolute path, enforce cwd boundary
   → server-manager.ts: find workspace root, ensure server, queue edit
   → client.ts: send didOpen/didChange, then pull diagnostics or wait for a push update
+  → server-manager.ts: return the known result at the soft deadline while full validation stays queued
   → format.ts: filter to errors+warnings, add source context, format compiler-style text and cross-file details
-  → index.ts: append formatted text to tool_result content
+  → index.ts: append the initial text to tool_result content
+  → late-delivery.ts: inject a changed final result as lsp-lite-diagnostics
 ```
 
 ## Key design choices
@@ -43,7 +45,7 @@ Each `didOpen` and `didChange` increments a generation counter for that URI. The
 
 ### Serialized edits per server
 
-Each `ManagedServer` has an `editQueue` promise chain. Edits to the same server are serialized so that `waitForDiagnostics` never has concurrent waiters on the same client. Different servers (different languages or different workspace roots) run in parallel.
+Each `ManagedServer` has an `editQueue` promise chain. Edits to the same server are serialized so that `waitForDiagnostics` never has concurrent waiters on the same client. The queue follows full background validation, not the initial soft-deadline result. Different servers (different languages or different workspace roots) run in parallel.
 
 ### Pull and push diagnostics
 
@@ -102,7 +104,9 @@ Each built-in language server has a default diagnostic timeout calibrated to its
 | pylsp         | 15s     | Moderate cold start, plugin-dependent analysis speed                     |
 | clangd        | 15s     | Fast for single files, slower for projects without compile_commands.json |
 
-Timeouts are per-attempt — with the default `maxRetries: 3`, the worst-case total wait for rust-analyzer is 4 × 30s + backoff ≈ 2 minutes. Timeouts are overridable via `.pi-lsp-lite.json` (global `diagnosticTimeout` or per-server `servers.<id>.diagnosticTimeout`).
+Timeouts are per-attempt — with the default `maxRetries: 3`, full rust-analyzer validation can take 4 × 30s + backoff ≈ 2 minutes. The tool result blocks only until `softDeadline` (default 10 seconds, clamped from 1 to 60 seconds). Retries continue in the background. If the final error/warning fingerprint set differs from the initial set, `index.ts` sends a displayed `lsp-lite-diagnostics` custom message with `deliverAs: "steer"` and no `triggerTurn`.
+
+Timeouts are overridable via `.pi-lsp-lite.json` (global `diagnosticTimeout`, `softDeadline`, or per-server `servers.<id>.diagnosticTimeout`).
 
 ### Workspace root detection
 
@@ -133,7 +137,7 @@ Each layer merges over the previous:
 
 - New server IDs are added (global config only — project config cannot define new servers for security)
 - Existing server IDs are partially overridden (only specified fields change)
-- Project config can tune safe local behaviour (`disabled`, per-server timeout, `maxRetries`) but cannot override trusted server shape (`command`, `args`, `extensions`, `rootPatterns`) for any existing server
+- Project config can tune safe local behaviour (`disabled`, per-server timeout, `maxRetries`, `softDeadline`) but cannot override trusted server shape (`command`, `args`, `extensions`, `rootPatterns`) for any existing server
 - Global config owns executable/server-shape changes, including custom servers and command/argv overrides
 - `"disabled": true` removes the server entirely (re-enabling in a later layer requires redefining the full server config)
 - Timeout overrides (`diagnosticTimeout`, `documentIdleTimeout`) cascade from global to per-server

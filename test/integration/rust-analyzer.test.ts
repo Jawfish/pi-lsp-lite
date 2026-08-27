@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { createServerManager } from "../../src/server-manager.js";
 import { builtinLanguages as languages } from "../../src/languages.js";
 import { pollUntil } from "../poll-until.js";
+import { handleFinal } from "../server-manager-helpers.js";
 
 const rustConfig = languages.find((l) => l.id === "rust")!;
 
@@ -26,7 +27,7 @@ describe("rust-analyzer integration", { skip: !process.env.INTEGRATION }, () => 
 
     // warmup: absorb cold start
     await writeFile(join(srcDir, "main.rs"), "fn main() {}\n");
-    const warmup = await manager.handleEdit(join(srcDir, "main.rs"), rustConfig, dir);
+    const warmup = await handleFinal(manager, join(srcDir, "main.rs"), rustConfig, dir);
     assert.notEqual(warmup.status, "unavailable", "rust-analyzer is not available — cannot run integration tests");
   });
 
@@ -39,7 +40,7 @@ describe("rust-analyzer integration", { skip: !process.env.INTEGRATION }, () => 
     await writeFile(join(srcDir, "main.rs"), "fn main() {\n  let x = \n}\n");
 
     const result = await pollUntil(
-      () => manager.handleEdit(join(srcDir, "main.rs"), rustConfig, dir),
+      () => handleFinal(manager, join(srcDir, "main.rs"), rustConfig, dir),
       (r) => r.diagnostics.some((d) => d.severity === 1),
     );
 
@@ -51,7 +52,7 @@ describe("rust-analyzer integration", { skip: !process.env.INTEGRATION }, () => 
     await writeFile(join(srcDir, "main.rs"), 'fn main() {\n    println!("hello");\n}\n');
 
     const result = await pollUntil(
-      () => manager.handleEdit(join(srcDir, "main.rs"), rustConfig, dir),
+      () => handleFinal(manager, join(srcDir, "main.rs"), rustConfig, dir),
       (r) => !r.diagnostics.some((d) => d.severity === 1),
     );
 
@@ -69,8 +70,8 @@ describe("rust-analyzer integration", { skip: !process.env.INTEGRATION }, () => 
       'mod lib;\n\nfn main() {\n    println!("{}", lib::add(1, 2));\n}\n',
     );
 
-    await manager.handleEdit(join(srcDir, "main.rs"), rustConfig, dir);
-    await manager.handleEdit(join(srcDir, "lib.rs"), rustConfig, dir);
+    await handleFinal(manager, join(srcDir, "main.rs"), rustConfig, dir);
+    await handleFinal(manager, join(srcDir, "lib.rs"), rustConfig, dir);
 
     // break the signature
     await writeFile(
@@ -79,7 +80,7 @@ describe("rust-analyzer integration", { skip: !process.env.INTEGRATION }, () => 
     );
 
     const result = await pollUntil(
-      () => manager.handleEdit(join(srcDir, "lib.rs"), rustConfig, dir),
+      () => handleFinal(manager, join(srcDir, "lib.rs"), rustConfig, dir),
       (r) => {
         const totalDiags = r.diagnostics.filter((d) => d.severity === 1).length
           + r.otherFiles.reduce((s, f) => s + f.errorCount, 0);

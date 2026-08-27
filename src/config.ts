@@ -18,6 +18,7 @@ export interface UserConfig {
   servers?: Record<string, ServerConfigOverride>;
   diagnosticTimeout?: number;
   documentIdleTimeout?: number;
+  softDeadline?: number;
 }
 
 export interface ResolvedConfig {
@@ -25,11 +26,13 @@ export interface ResolvedConfig {
   diagnosticTimeout: number;
   documentIdleTimeout: number;
   perServerTimeout: Map<string, number>;
+  softDeadline: number;
 }
 
 export const DEFAULT_DIAGNOSTIC_TIMEOUT = 5_000;
 export const DEFAULT_DOCUMENT_IDLE_TIMEOUT = 120_000;
 export const DEFAULT_MAX_RETRIES = 3;
+export const DEFAULT_SOFT_DEADLINE = 10_000;
 
 const MIN_DIAGNOSTIC_TIMEOUT = 1_000;
 const MAX_DIAGNOSTIC_TIMEOUT = 60_000;
@@ -37,6 +40,8 @@ const MIN_DOCUMENT_IDLE_TIMEOUT = 10_000;
 const MAX_DOCUMENT_IDLE_TIMEOUT = 600_000;
 const MIN_MAX_RETRIES = 0;
 const MAX_MAX_RETRIES = 10;
+const MIN_SOFT_DEADLINE = 1_000;
+const MAX_SOFT_DEADLINE = 60_000;
 
 function clamp(value: unknown, min: number, max: number, fallback: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
@@ -284,6 +289,7 @@ export async function loadConfig(cwd: string, globalConfigPath?: string): Promis
   const perServerTimeout = new Map<string, number>();
   let diagnosticTimeout = DEFAULT_DIAGNOSTIC_TIMEOUT;
   let documentIdleTimeout = DEFAULT_DOCUMENT_IDLE_TIMEOUT;
+  let softDeadline = DEFAULT_SOFT_DEADLINE;
 
   const layers: [UserConfig | null, ConfigSource][] = [
     [globalConfig, "global"],
@@ -305,7 +311,21 @@ export async function loadConfig(cwd: string, globalConfigPath?: string): Promis
     if (layer.documentIdleTimeout !== undefined) {
       documentIdleTimeout = clamp(layer.documentIdleTimeout, MIN_DOCUMENT_IDLE_TIMEOUT, MAX_DOCUMENT_IDLE_TIMEOUT, documentIdleTimeout);
     }
+    if (layer.softDeadline !== undefined) {
+      softDeadline = clamp(
+        layer.softDeadline,
+        MIN_SOFT_DEADLINE,
+        MAX_SOFT_DEADLINE,
+        softDeadline,
+      );
+    }
   }
 
-  return { servers, diagnosticTimeout, documentIdleTimeout, perServerTimeout };
+  return {
+    servers,
+    diagnosticTimeout,
+    documentIdleTimeout,
+    perServerTimeout,
+    softDeadline,
+  };
 }

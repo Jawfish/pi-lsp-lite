@@ -24,7 +24,9 @@ import {
 
 export interface FakeServerOptions {
   diagnosticDelay?: number;
+  diagnosticsByText?: Map<string, Diagnostic[]>;
   diagnosticsByUri?: Map<string, Diagnostic[]>;
+  initializeDelay?: number;
   otherFileDiagnostics?: Map<string, Diagnostic[]>;
   crashOnInit?: boolean;
   neverPublish?: boolean;
@@ -55,6 +57,7 @@ export function startFakeServer(options: FakeServerOptions = {}) {
   const crashOnInit = options.crashOnInit ?? false;
   const neverPublish = options.neverPublish ?? false;
   const neverShutdown = options.neverShutdown ?? false;
+  const initializeDelay = options.initializeDelay ?? 0;
   const publishOnlyOnce = options.publishOnlyOnce ?? false;
   const publishOnAttempt = options.publishOnAttempt ?? 1;
   const pullCancelAttempts = options.pullCancelAttempts ?? 0;
@@ -75,9 +78,12 @@ export function startFakeServer(options: FakeServerOptions = {}) {
     new StreamMessageWriter(process.stdout),
   );
 
-  connection.onRequest(InitializeRequest.type, (params) => {
+  connection.onRequest(InitializeRequest.type, async (params) => {
     if (crashOnInit) {
       process.exit(1);
+    }
+    if (initializeDelay > 0) {
+      await new Promise((resolve) => setTimeout(resolve, initializeDelay));
     }
     relatedInformationSupported =
       params.capabilities.textDocument?.publishDiagnostics?.relatedInformation === true;
@@ -103,7 +109,7 @@ export function startFakeServer(options: FakeServerOptions = {}) {
     return diagnostics.map(({ relatedInformation: _relatedInformation, ...diagnostic }) => diagnostic);
   }
 
-  function publishDiagnostics(uri: string) {
+  function publishDiagnostics(uri: string, text: string, version: number) {
     if (neverPublish || pullDiagnostics) return;
 
     const count = (attemptCounts.get(uri) ?? 0) + 1;
@@ -112,12 +118,15 @@ export function startFakeServer(options: FakeServerOptions = {}) {
     if (count < publishOnAttempt || (publishOnlyOnce && count > 1)) return;
 
     const diags = diagnosticsForClient(
-      options.diagnosticsByUri?.get(uri) ?? [defaultDiagnostic],
+      options.diagnosticsByText?.get(text) ??
+        options.diagnosticsByUri?.get(uri) ??
+        [defaultDiagnostic],
     );
 
     const publish = () => {
       connection.sendNotification(PublishDiagnosticsNotification.type, {
         uri,
+        version,
         diagnostics: diags,
       });
 
@@ -140,11 +149,16 @@ export function startFakeServer(options: FakeServerOptions = {}) {
   }
 
   connection.onNotification(DidOpenTextDocumentNotification.type, (params) => {
-    publishDiagnostics(params.textDocument.uri);
+    publishDiagnostics(
+      params.textDocument.uri,
+      params.textDocument.text,
+      params.textDocument.version,
+    );
   });
 
   connection.onNotification(DidChangeTextDocumentNotification.type, (params) => {
-    publishDiagnostics(params.textDocument.uri);
+    const text = params.contentChanges.at(-1)?.text ?? "";
+    publishDiagnostics(params.textDocument.uri, text, params.textDocument.version);
   });
 
   connection.onNotification(DidCloseTextDocumentNotification.type, () => {});
@@ -230,6 +244,7 @@ if (process.argv.includes("--run")) {
   if (optionsJson) {
     const raw = JSON.parse(optionsJson.slice("--options=".length));
     if (raw.diagnosticDelay) options.diagnosticDelay = raw.diagnosticDelay;
+    if (raw.initializeDelay) options.initializeDelay = raw.initializeDelay;
     if (raw.crashOnInit) options.crashOnInit = raw.crashOnInit;
     if (raw.neverPublish) options.neverPublish = raw.neverPublish;
     if (raw.neverShutdown) options.neverShutdown = raw.neverShutdown;
@@ -246,6 +261,9 @@ if (process.argv.includes("--run")) {
     if (raw.pushAfterPullOnlyOnce) options.pushAfterPullOnlyOnce = raw.pushAfterPullOnlyOnce;
     if (raw.pushAfterPullDiagnostics) {
       options.pushAfterPullDiagnostics = new Map(Object.entries(raw.pushAfterPullDiagnostics));
+    }
+    if (raw.diagnosticsByText) {
+      options.diagnosticsByText = new Map(Object.entries(raw.diagnosticsByText));
     }
     if (raw.diagnosticsByUri) {
       options.diagnosticsByUri = new Map(Object.entries(raw.diagnosticsByUri));

@@ -416,6 +416,50 @@ describe("LspClient", () => {
     await client.shutdown();
   });
 
+  it("aborts a push wait promptly and clears its waiter", async () => {
+    const child = spawnFake({ publishOnAttempt: 2 });
+    const client = createLspClient(child);
+    await client.initialize("/tmp/test-workspace");
+
+    const uri = "file:///tmp/test-workspace/abort.go";
+    client.didOpen(uri, "go", "package main");
+    const controller = new AbortController();
+    const start = Date.now();
+    const pending = client.waitForDiagnostics(uri, 10_000, controller.signal);
+    setTimeout(() => controller.abort(), 25);
+
+    await assert.rejects(pending, (error: Error) => error.name === "AbortError");
+    assert.ok(Date.now() - start < 500, "push wait should abort promptly");
+
+    client.didChange(uri, "package main\n");
+    const next = await client.waitForDiagnostics(uri, 2_000);
+    assert.equal(next.status, "ok");
+    assert.equal(next.diagnostics.length, 1);
+
+    await client.shutdown();
+  });
+
+  it("aborts active pull requests promptly", async () => {
+    const uri = "file:///tmp/test-workspace/abort.ts";
+    const child = spawnFake({
+      neverPullUris: [uri],
+      pullDiagnostics: true,
+    });
+    const client = createLspClient(child);
+    await client.initialize("/tmp/test-workspace");
+
+    client.didOpen(uri, "typescript", "const value = 1;");
+    const controller = new AbortController();
+    const start = Date.now();
+    const pending = client.waitForDiagnostics(uri, 10_000, controller.signal);
+    setTimeout(() => controller.abort(), 25);
+
+    await assert.rejects(pending, (error: Error) => error.name === "AbortError");
+    assert.ok(Date.now() - start < 500, "pull wait should abort promptly");
+
+    await client.shutdown();
+  });
+
   it("returns latest diagnostics after rapid didChange", async () => {
     const uri = "file:///tmp/test-workspace/main.go";
     const child = spawnFake({
@@ -490,10 +534,9 @@ describe("LspClient", () => {
 
     // wait enough time for the delayed publish to fire
     await new Promise((r) => setTimeout(r, 500));
+    assert.equal(client.getAllDiagnostics().has(uri), false);
 
     // the diagnostics handler should have ignored the publish for the closed URI
-    // re-open the URI: if ghost diagnostics leaked, the entry would already exist
-    // with stale data; a fresh didOpen should start clean
     client.didOpen(uri, "go", "package main");
     const result = await client.waitForDiagnostics(uri, 2000);
     assert.equal(result.status, "ok");
@@ -501,6 +544,43 @@ describe("LspClient", () => {
     // the key assertion: we didn't accumulate ghost state from the closed-then-reopened cycle
     assert.equal(result.diagnostics.length, 1);
     assert.equal(result.diagnostics[0].message, "fake error");
+
+    await client.shutdown();
+  });
+
+  it("ignores a stale version from before close and reopen", async () => {
+    const uri = "file:///tmp/test-workspace/reopened.go";
+    const child = spawnFake({
+      diagnosticDelay: 200,
+      diagnosticsByText: {
+        "package old": [
+          {
+            range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+            severity: 1,
+            message: "old error",
+            source: "fake",
+          },
+        ],
+        "package new": [
+          {
+            range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+            severity: 1,
+            message: "new error",
+            source: "fake",
+          },
+        ],
+      },
+    });
+    const client = createLspClient(child);
+    await client.initialize("/tmp/test-workspace");
+
+    client.didOpen(uri, "go", "package old");
+    client.didClose(uri);
+    client.didOpen(uri, "go", "package new");
+    const result = await client.waitForDiagnostics(uri, 2000);
+
+    assert.equal(result.status, "ok");
+    assert.equal(result.diagnostics[0]?.message, "new error");
 
     await client.shutdown();
   });

@@ -37,6 +37,8 @@ That's it. If you have `gopls`, `rust-analyzer`, `tsgo`, `pylsp`, or `clangd` on
 
 The extension appends these diagnostics to the tool result, so the agent can self-correct in the same turn. The first five diagnostics include a source line, trimmed to 120 characters. Each diagnostic can show two related locations. A changed cross-file result can show three diagnostics per file, with errors first.
 
+Validation blocks the tool result for at most `softDeadline` (10 seconds by default). If validation continues and finds different diagnostics, the extension injects the final result as an `lsp-lite-diagnostics` message. It does not start a model turn while the agent is idle.
+
 ## Commands
 
 | Command        | What it does                                                            |
@@ -84,8 +86,9 @@ Works without config. Use project config (`.pi-lsp-lite.json` or `.pi/lsp-lite.j
 | `servers.<id>.disabled`          | Disable this server              | `false`      |
 | `diagnosticTimeout`              | Global default timeout (ms)      | `5000`       |
 | `documentIdleTimeout`            | Close idle documents after (ms)  | `120000`     |
+| `softDeadline`                   | Maximum blocking wait (ms)       | `10000`      |
 
-Project config merges over global for safe tuning fields. Repositories can disable servers and tune timeouts/retries, but they cannot change the executable, argv, extensions, or root patterns for any existing server; put those trusted changes in global config.
+Project config merges over global for safe tuning fields. Repositories can disable servers and tune timeouts, retries, and the soft deadline, but they cannot change the executable, argv, extensions, or root patterns for any existing server; put those trusted changes in global config. `softDeadline` is clamped from 1000 to 60000 ms.
 
 ## How it works
 
@@ -94,8 +97,10 @@ Project config merges over global for safe tuning fields. Repositories can disab
 3. Spawns (or reuses) an LSP server for that language + root
 4. Sends `didChange`, then pulls diagnostics when the server supports LSP 3.17 diagnostic requests
 5. Falls back to push diagnostics for older servers
-6. If the first validation times out, retries with exponential backoff and jitter, up to `maxRetries` times
-7. Filters errors and warnings, then appends the formatted result to the tool output and the TUI
+6. Waits up to `softDeadline`, then appends the diagnostics known so far
+7. Continues timed-out validation and retries in the background
+8. Injects a final custom message only when its diagnostic fingerprints differ
+9. Filters errors and warnings, then formats the result for agent context and the TUI
 
 For pull servers with inter-file dependencies, the extension checks all open documents after an edit. Push servers compare each notification with the stored snapshot. When no unchanged result arrives, the extension reports one incomplete result with its last validated snapshot and skips duplicate retries.
 
