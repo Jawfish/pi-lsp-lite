@@ -16,6 +16,10 @@ src/
   install-registry.ts  → known install commands for built-in servers
   client.ts            → LSP protocol client (JSON-RPC over stdio)
   server-manager.ts    → server lifecycle and edit orchestration
+  progress.ts          → validation working-message coordination
+  status.ts            → footer and command status formatting
+  notifications.ts     → diagnostic notification policy
+  message-renderer.ts  → themed late-diagnostic messages
   change-detection.ts  → tracked-file snapshots and comparison
   bash-awareness.ts    → bash resync and diagnostic delivery
   late-delivery.ts     → changed background-result messages
@@ -110,6 +114,18 @@ The client requests `relatedInformation` and keeps the full `Diagnostic` objects
 
 For each changed cross-file result, the client keeps up to three diagnostics. Errors come before warnings. The cross-file footer uses the same line formatter as target-file results and `/lsp-diag`.
 
+### TUI progress, status, and messages
+
+Each call to `waitForDiagnostics` emits start and end events with the server id, workspace root, one-based attempt, and total attempts. `progress.ts` tracks active validations by server and root. One active validation sets a working message such as `lsp: rust-analyzer validating (attempt 2/4)`. Concurrent validations add a count instead of clearing the message between completions. The controller restores pi's default only after its final matching event and only when it set a message. `index.ts` installs the controller only when `ctx.hasUI` is true.
+
+The server manager exposes starting and running activity snapshots and reports lifecycle changes. `status.ts` combines this activity with error and warning totals from all current diagnostics. `index.ts` updates the `lsp` footer status after validation and lifecycle events, and clears it when no server is active. Session shutdown also clears the extension's working message and footer status.
+
+Normal write, edit, and agent-bash diagnostics remain in tool results without a duplicate full-text notification. An unavailable server still produces a warning notification. Extension-overlap warnings use the same UI path during config loading instead of stderr. Install and command feedback remains unchanged.
+
+`message-renderer.ts` renders injected `lsp-lite-diagnostics` messages. It dims paths and applies the theme's error and warning colors. The collapsed view keeps the summary, first diagnostic, and omitted-line count. The expanded view includes every formatted line. Invalid content or details use safe fallback text.
+
+`/lsp-status` uses a display-width-aware table with state, server, command, and install columns. Its glyphs are `✓` running, `○` idle, `✗` missing, and `⏳` starting. Starting and running roots appear as subrows. Running subrows include the process id, uptime, and open-document count.
+
 ### Bash change detection
 
 Before an agent `bash` tool or user `!` command runs, `index.ts` asks the server manager for its running roots and open document URIs. If no server runs, capture returns before any file metadata call. Each snapshot records the modification time and size of open documents. It also includes configured root patterns and these standard markers:
@@ -185,14 +201,15 @@ Watchers start after config loading in `session_start`. `session_shutdown` close
 
 ## Extension hooks used
 
-| Hook               | Purpose                                                                                                         |
-| ------------------ | --------------------------------------------------------------------------------------------------------------- |
-| `tool_call`        | Record new writes and capture tracked files before agent bash                                                   |
-| `tool_result`      | Append write/edit diagnostics and resync files after agent bash                                                 |
-| `user_bash`        | Wrap local `!` execution, then resync and queue diagnostics                                                     |
-| `session_start`    | Load config, create the server manager, and start config watchers                                               |
-| `session_shutdown` | Close config watchers, clear snapshots, and kill all servers                                                    |
-| `registerCommand`  | Provide `/lsp-reload`, `/lsp-status`, `/lsp-diag`, `/lsp-add`, `/lsp-remove`, `/lsp-toggle`, and `/lsp-install` |
+| Hook                      | Purpose                                                                     |
+| ------------------------- | --------------------------------------------------------------------------- |
+| `tool_call`               | Record new writes and capture tracked files before agent bash               |
+| `tool_result`             | Append write/edit diagnostics and resync files after agent bash             |
+| `user_bash`               | Wrap local `!` execution, then resync and queue diagnostics                 |
+| `session_start`           | Load config, start watchers, and install guarded TUI state                  |
+| `session_shutdown`        | Clear TUI state, close watchers and snapshots, and kill all servers         |
+| `registerMessageRenderer` | Theme injected `lsp-lite-diagnostics` messages                              |
+| `registerCommand`         | Provide config, status, diagnostic, server-management, and install commands |
 
 ## Adding a language
 

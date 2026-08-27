@@ -8,6 +8,7 @@ import {
 import type { InstallEntry } from "../src/install-registry.js";
 import type { LanguageServerConfig } from "../src/languages.js";
 import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 const builtinTs: LanguageServerConfig = {
   id: "typescript",
@@ -53,6 +54,10 @@ describe("buildServerStates", () => {
           lastActivity: Date.now(),
         },
       ],
+      activity: [
+        { id: "typescript", root: "/repo", state: "running" },
+        { id: "lua", root: "/lua", state: "starting" },
+      ],
       installRegistry,
       resolveCommand: async (command) => command === "typescript-language-server" ? "/bin/typescript-language-server" : null,
     });
@@ -65,12 +70,14 @@ describe("buildServerStates", () => {
     assert.equal(typescript.installed, true);
     assert.equal(typescript.installable, true);
     assert.equal(typescript.running.length, 1);
+    assert.deepEqual(typescript.starting, []);
 
     const lua = states.find((s) => s.id === "lua");
     assert.ok(lua);
     assert.equal(lua.enabled, true);
     assert.equal(lua.installed, false);
     assert.equal(lua.installable, false);
+    assert.deepEqual(lua.starting, ["/lua"]);
 
     const haskell = states.find((s) => s.id === "haskell");
     assert.ok(haskell);
@@ -91,6 +98,7 @@ describe("buildServerStates", () => {
         },
       },
       running: [],
+      activity: [],
       installRegistry,
       resolveCommand: async (command) => command === "custom-typescript-language-server" ? "/bin/custom-typescript-language-server" : null,
     });
@@ -137,15 +145,28 @@ describe("formatStatusLine", () => {
 });
 
 describe("formatServerStates", () => {
-  it("shows installed/running and missing/manual states", () => {
-    const output = formatServerStates([
+  it("aligns state, server, command, and install columns", () => {
+    const states = [
       {
         id: "typescript",
         command: "typescript-language-server",
         enabled: true,
         installed: true,
         installable: true,
-        running: [{ id: "typescript", root: "/repo", pid: 123, uptime: 5_000, openDocuments: 2, lastActivity: Date.now() }],
+        running: [
+          { id: "typescript", root: "/repo-one", pid: 123, uptime: 5_000, openDocuments: 2, lastActivity: Date.now() },
+          { id: "typescript", root: "/repo-two", pid: 456, uptime: 8_000, openDocuments: 1, lastActivity: Date.now() },
+        ],
+        starting: [],
+      },
+      {
+        id: "rust",
+        command: "rust-analyzer",
+        enabled: true,
+        installed: true,
+        installable: true,
+        running: [],
+        starting: ["/rust"],
       },
       {
         id: "lua",
@@ -154,10 +175,41 @@ describe("formatServerStates", () => {
         installed: false,
         installable: false,
         running: [],
+        starting: [],
       },
-    ]);
+      {
+        id: "python",
+        command: "pylsp",
+        enabled: true,
+        installed: true,
+        installable: true,
+        running: [],
+        starting: [],
+      },
+    ];
+    const output = formatServerStates(states);
+    const topLevel = output.split("\n").filter((line) =>
+      /^[✓○✗⏳]/u.test(line)
+    );
+    const serverOffsets = topLevel.map((line, index) =>
+      visibleWidth(line.slice(0, line.indexOf(states[index].id)))
+    );
+    const commandOffsets = topLevel.map((line, index) =>
+      visibleWidth(line.slice(0, line.indexOf(states[index].command)))
+    );
 
-    assert.match(output, /typescript — enabled — installed — running pid=123 root=\/repo/);
-    assert.match(output, /lua — enabled — missing — not running — cmd=lua-language-server — manual install required/);
+    assert.equal(new Set(serverOffsets).size, 1);
+    assert.equal(new Set(commandOffsets).size, 1);
+    assert.match(output, /^✓\s+typescript\s+typescript-language-server\s+installed$/mu);
+    assert.match(output, /^⏳\s+rust\s+rust-analyzer\s+installed$/mu);
+    assert.match(output, /^✗\s+lua\s+lua-language-server\s+missing \(manual\)$/mu);
+    assert.match(output, /^○\s+python\s+pylsp\s+installed$/mu);
+    assert.match(output, /↳ \/repo-one  pid=123  up=5s  open=2/u);
+    assert.match(output, /↳ \/repo-two  pid=456  up=8s  open=1/u);
+    assert.match(output, /↳ \/rust  starting/u);
+    assert.match(
+      output,
+      /Legend: ✓ running  ○ idle  ✗ missing  ⏳ starting/u,
+    );
   });
 });

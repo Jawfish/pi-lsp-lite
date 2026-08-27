@@ -47,11 +47,17 @@ The extension reads each changed open document again, sends it to its server, an
 
 Agent `bash` diagnostics append to the tool result when ready before the soft deadline. Later results use the same deduplicated `lsp-lite-diagnostics` message as write and edit tools. Pi queues results from user `!` commands for the next turn. These messages leave an idle pi session idle.
 
+## TUI feedback
+
+While validation runs, the working row names the server and attempt, such as `lsp: rust-analyzer validating (attempt 2/4)`. Concurrent validations stay in one message with an additional count. The footer shows starting and running servers plus current error and warning totals. It clears after the last server stops.
+
+Diagnostics appended to tool results are not repeated as notifications. Missing-server results, config warnings, and command feedback still notify. Late `lsp-lite-diagnostics` messages dim paths and color errors and warnings. Their collapsed view shows a summary and the first finding; expand the message to see every line.
+
 ## Commands
 
 | Command        | What it does                                                            |
 | -------------- | ----------------------------------------------------------------------- |
-| `/lsp-status`  | Show running servers, PIDs, workspace roots, uptime                     |
+| `/lsp-status`  | Show an aligned server-state table with one row per running root        |
 | `/lsp-reload`  | Reload config now and report what changed                               |
 | `/lsp-diag`    | Show all current diagnostics (or `/lsp-diag path/to/file` for one file) |
 | `/lsp-add`     | Interactively add a new language server                                 |

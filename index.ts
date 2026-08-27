@@ -130,6 +130,7 @@ export default function (pi: ExtensionAPI) {
       active: servers,
       globalConfig: await readGlobalConfig(),
       running: manager.status(),
+      activity: manager.activity(),
       installRegistry,
       resolveCommand: which,
     });
