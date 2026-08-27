@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { handleInitial } from "./server-manager-helpers.js";
+import type { ValidationProgress } from "../src/progress.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -133,7 +134,15 @@ describe("Diagnostic delta", () => {
 
 describe("ServerManager", () => {
   it("first edit spawns server, second reuses it", async () => {
-    const manager = createServerManager();
+    const activitySnapshots: string[][] = [];
+    let manager: ReturnType<typeof createServerManager>;
+    manager = createServerManager({
+      onServerStateChange: () => {
+        activitySnapshots.push(
+          manager.activity().map(({ id, state }) => `${id}:${state}`),
+        );
+      },
+    });
     const dir = await makeTempDir();
     await writeFile(join(dir, "go.mod"), "module test");
     const filePath = join(dir, "main.go");
@@ -164,6 +173,13 @@ describe("ServerManager", () => {
     assert.equal(status2[0].pid, status1[0].pid);
 
     await manager.shutdownAll();
+    assert.ok(
+      activitySnapshots.some((activity) => activity.includes("fake:starting")),
+    );
+    assert.ok(
+      activitySnapshots.some((activity) => activity.includes("fake:running")),
+    );
+    assert.deepEqual(activitySnapshots.at(-1), []);
   });
 
   it("skips the first baseline and uses zero for a newly created file", async () => {
@@ -828,7 +844,11 @@ describe("Retry logic", () => {
       args: [fakeServerPath, "--run", '--options={"publishOnAttempt":3}'],
       rootPatterns: ["go.mod"],
     };
-    const manager = createServerManager({ diagnosticTimeout: 500 });
+    const events: ValidationProgress[] = [];
+    const manager = createServerManager({
+      diagnosticTimeout: 500,
+      onValidationProgress: (event) => events.push(event),
+    });
     const dir = await makeTempDir();
     await writeFile(join(dir, "go.mod"), "module test");
     const filePath = join(dir, "main.go");
@@ -838,6 +858,19 @@ describe("Retry logic", () => {
     assert.equal(result.status, "ok");
     assert.equal(result.retryAttempts, 2);
     assert.ok(result.diagnostics.length > 0);
+    assert.deepEqual(
+      events.map((event) =>
+        `${event.phase}:${event.serverId}:${event.root}:${event.attempt}/${event.totalAttempts}`
+      ),
+      [
+        `start:fake-publish3rd:${dir}:1/4`,
+        `end:fake-publish3rd:${dir}:1/4`,
+        `start:fake-publish3rd:${dir}:2/4`,
+        `end:fake-publish3rd:${dir}:2/4`,
+        `start:fake-publish3rd:${dir}:3/4`,
+        `end:fake-publish3rd:${dir}:3/4`,
+      ],
+    );
 
     await manager.shutdownAll();
   });

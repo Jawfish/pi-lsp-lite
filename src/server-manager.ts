@@ -27,6 +27,7 @@ import {
   raceWithAbort,
 } from "./abort.js";
 import type { ChangeDetectionTarget } from "./change-detection.js";
+import type { ValidationProgress } from "./progress.js";
 
 export interface EditDiagnosticResult extends DiagnosticResult {
   delta: DiagnosticDelta;
@@ -62,8 +63,10 @@ interface ManagedServer {
 }
 
 interface PendingServer {
+  config: LanguageServerConfig;
   controller: AbortController;
   promise: Promise<ManagedServer | null>;
+  root: string;
   waiters: number;
 }
 
@@ -83,6 +86,7 @@ export interface ServerManager {
     options?: HandleEditOptions,
   ): Promise<EditDiagnosticOutcome>;
   status(): ServerStatus[];
+  activity(): ServerActivity[];
   snapshotTargets(): ChangeDetectionTarget[];
   closeDocument(filePath: string): void;
   didChangeWatchedFiles(changes: RoutedWatchedFileChange[]): void;
@@ -99,6 +103,12 @@ export interface ServerStatus {
   lastActivity: number;
 }
 
+export interface ServerActivity {
+  id: string;
+  root: string;
+  state: "starting" | "running";
+}
+
 const IDLE_TIMEOUT_MS = 240_000;
 const INIT_TIMEOUT_MS = 10_000;
 const SWEEP_INTERVAL_MS = 60_000;
@@ -109,6 +119,8 @@ export interface ServerManagerOptions {
   perServerTimeout?: Map<string, number>;
   maxRetries?: number;
   softDeadline?: number;
+  onValidationProgress?: (event: ValidationProgress) => void;
+  onServerStateChange?: () => void;
 }
 
 const RETRY_BASE_DELAY_MS = 500;
@@ -185,6 +197,8 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
   const perServerTimeout = options.perServerTimeout ?? new Map();
   const defaultMaxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
   const softDeadline = options.softDeadline ?? DEFAULT_SOFT_DEADLINE;
+  const onValidationProgress = options.onValidationProgress;
+  const onServerStateChange = options.onServerStateChange;
   const servers = new Map<string, ManagedServer>();
   const pending = new Map<string, PendingServer>();
   const disabledBinaries = new Set<string>();
@@ -192,6 +206,14 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
   const activeEdits = new Map<string, { controller: AbortController }>();
   const shutdownController = new AbortController();
   let sweepTimer: ReturnType<typeof setInterval> | null = null;
+
+  function reportServerStateChange(): void {
+    try {
+      onServerStateChange?.();
+    } catch (error) {
+      console.error("[pi-lsp-lite] server state callback failed:", error);
+    }
+  }
 
   function startSweepTimer() {
     if (sweepTimer) return;
@@ -246,6 +268,7 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     await killProcess(server.process);
     if (servers.get(server.serverKey) === server) {
       servers.delete(server.serverKey);
+      reportServerStateChange();
     }
     if (servers.size === 0) stopSweepTimer();
   }
@@ -332,12 +355,14 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       if (server.idleTimer) clearTimeout(server.idleTimer);
       if (servers.get(serverKey) === server) {
         servers.delete(serverKey);
+        reportServerStateChange();
       }
       if (servers.size === 0) stopSweepTimer();
     });
 
     resetIdleTimer(server);
     servers.set(serverKey, server);
+    reportServerStateChange();
     startSweepTimer();
     return server;
   }
@@ -367,8 +392,10 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         shutdownController.signal,
       ]);
       const pendingServer: PendingServer = {
+        config,
         controller,
         promise: Promise.resolve(null),
+        root,
         waiters: 0,
       };
       pendingServer.promise = spawnServer(
@@ -379,9 +406,11 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       ).finally(() => {
         if (pending.get(serverKey) === pendingServer) {
           pending.delete(serverKey);
+          reportServerStateChange();
         }
       });
       pending.set(serverKey, pendingServer);
+      reportServerStateChange();
       inflight = pendingServer;
     }
 
@@ -400,6 +429,36 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     const raw = config.maxRetries ?? defaultMaxRetries;
     if (typeof raw !== "number" || !Number.isFinite(raw)) return defaultMaxRetries;
     return Math.max(0, Math.min(10, Math.floor(raw)));
+  }
+
+  function reportValidationProgress(event: ValidationProgress): void {
+    try {
+      onValidationProgress?.(event);
+    } catch (error) {
+      console.error("[pi-lsp-lite] validation progress callback failed:", error);
+    }
+  }
+
+  async function waitForDiagnosticAttempt(
+    server: ManagedServer,
+    uri: string,
+    timeout: number,
+    signal: AbortSignal | undefined,
+    attempt: number,
+    totalAttempts: number,
+  ): Promise<DiagnosticResult> {
+    const progress = {
+      serverId: server.config.id,
+      root: server.root,
+      attempt,
+      totalAttempts,
+    };
+    reportValidationProgress({ phase: "start", ...progress });
+    try {
+      return await server.client.waitForDiagnostics(uri, timeout, signal);
+    } finally {
+      reportValidationProgress({ phase: "end", ...progress });
+    }
   }
 
   function withDelta(
@@ -476,7 +535,14 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
     };
 
     let lastResult = accumulateOtherFiles(
-      await server.client.waitForDiagnostics(uri, timeout, signal),
+      await waitForDiagnosticAttempt(
+        server,
+        uri,
+        timeout,
+        signal,
+        1,
+        retries + 1,
+      ),
     );
 
     for (
@@ -494,7 +560,14 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
       server.client.didChange(uri, content);
       server.openDocuments.set(uri, Date.now());
       const result = accumulateOtherFiles(
-        await server.client.waitForDiagnostics(uri, timeout, signal),
+        await waitForDiagnosticAttempt(
+          server,
+          uri,
+          timeout,
+          signal,
+          attempt + 2,
+          retries + 1,
+        ),
       );
       result.retryAttempts = attempt + 1;
 
@@ -622,6 +695,25 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         openDocuments: s.openDocuments.size,
         lastActivity: s.lastActivity,
       }));
+    },
+
+    activity(): ServerActivity[] {
+      const activity: ServerActivity[] = Array.from(servers.values()).map(
+        (server) => ({
+          id: server.config.id,
+          root: server.root,
+          state: "running",
+        }),
+      );
+      for (const [serverKey, server] of pending) {
+        if (servers.has(serverKey)) continue;
+        activity.push({
+          id: server.config.id,
+          root: server.root,
+          state: "starting",
+        });
+      }
+      return activity;
     },
 
     snapshotTargets(): ChangeDetectionTarget[] {

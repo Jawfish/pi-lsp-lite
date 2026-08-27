@@ -2,7 +2,13 @@ import {
   createLocalBashOperations,
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { createServerManager } from "./src/server-manager.js";
+import {
+  createWorkingMessageController,
+  type ValidationProgress,
+  type WorkingMessageController,
+} from "./src/progress.js";
 import { languageForFile, checkExtensionOverlaps, builtinLanguages, type LanguageServerConfig } from "./src/languages.js";
 import { formatDiagnostic, formatDiagnostics } from "./src/format.js";
 import { DiagnosticSeverity } from "vscode-languageserver-protocol";
@@ -24,12 +30,21 @@ import {
 } from "./src/config-watch.js";
 import { fileUri, which, isInsideCwd } from "./src/util.js";
 import { installRegistry, installCommandFor } from "./src/install-registry.js";
-import { buildServerStates, formatServerStates } from "./src/status.js";
+import {
+  buildServerStates,
+  formatServerStates,
+  formatStatusLine,
+} from "./src/status.js";
 import { resolve } from "node:path";
 import { lstat, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { isAbortError } from "./src/abort.js";
-import { deliverLateDiagnostics } from "./src/late-delivery.js";
+import {
+  deliverLateDiagnostics,
+  LSP_DIAGNOSTICS_MESSAGE_TYPE,
+} from "./src/late-delivery.js";
+import { renderDiagnosticMessage } from "./src/message-renderer.js";
+import { diagnosticNotification } from "./src/notifications.js";
 import {
   captureBashChangeSnapshot,
   prepareBashDiagnostics,
@@ -44,6 +59,10 @@ export default function (pi: ExtensionAPI) {
   let currentConfig: ResolvedConfig | null = null;
   let reloadTail: Promise<unknown> = Promise.resolve();
   let configWatcher: ConfigWatchHandle | null = null;
+  let workingMessageController: WorkingMessageController | null = null;
+  let validationProgressHandler: ((event: ValidationProgress) => void) | null = null;
+  let statusSetter: ((text: string | undefined) => void) | null = null;
+  let configWarningNotifier: ((warning: string) => void) | null = null;
   const pendingNewFiles = new Map<string, boolean>();
   const pendingBashSnapshots = new Map<string, BashChangeSnapshot>();
 
@@ -57,12 +76,23 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
+  function refreshFooterStatus(): void {
+    statusSetter?.(
+      formatStatusLine(manager.activity(), manager.getAllDiagnostics()),
+    );
+  }
+
   function createConfiguredManager(config: ResolvedConfig) {
     return createServerManager({
       diagnosticTimeout: config.diagnosticTimeout,
       documentIdleTimeout: config.documentIdleTimeout,
       perServerTimeout: config.perServerTimeout,
       softDeadline: config.softDeadline,
+      onValidationProgress: (event) => {
+        validationProgressHandler?.(event);
+        if (event.phase === "end") refreshFooterStatus();
+      },
+      onServerStateChange: refreshFooterStatus,
     });
   }
 
@@ -80,9 +110,10 @@ export default function (pi: ExtensionAPI) {
     currentConfig = applied.runtime.config;
     manager = applied.runtime.manager;
     servers = resolved.servers;
+    refreshFooterStatus();
 
     for (const warning of checkExtensionOverlaps(servers)) {
-      console.error(`[pi-lsp-lite] ${warning}`);
+      configWarningNotifier?.(warning);
     }
     return applied.change;
   }
@@ -99,13 +130,36 @@ export default function (pi: ExtensionAPI) {
       active: servers,
       globalConfig: await readGlobalConfig(),
       running: manager.status(),
+      activity: manager.activity(),
       installRegistry,
       resolveCommand: which,
     });
   }
 
+  pi.registerMessageRenderer(
+    LSP_DIAGNOSTICS_MESSAGE_TYPE,
+    (message, { expanded }, theme) =>
+      new Text(renderDiagnosticMessage(message, expanded, theme), 1, 0),
+  );
+
   pi.on("session_start", async (_event, ctx) => {
+    workingMessageController?.reset();
+    statusSetter?.(undefined);
+    statusSetter = ctx.hasUI
+      ? (text) => ctx.ui.setStatus("lsp", text)
+      : null;
+    configWarningNotifier = ctx.hasUI
+      ? (warning) => ctx.ui.notify(`pi-lsp-lite: ${warning}`, "warning")
+      : null;
+    workingMessageController = ctx.hasUI
+      ? createWorkingMessageController((message) =>
+        ctx.ui.setWorkingMessage(message)
+      )
+      : null;
+    validationProgressHandler = workingMessageController?.handle ?? null;
+
     await reloadConfig(ctx.cwd);
+    refreshFooterStatus();
     configWatcher?.close();
     configWatcher = watchConfigFiles({
       cwd: ctx.cwd,
@@ -175,7 +229,6 @@ export default function (pi: ExtensionAPI) {
         }
         if (!prepared.content) return;
 
-        if (ctx.hasUI) ctx.ui.notify(prepared.content.trim(), "warning");
         return {
           content: [
             ...event.content,
@@ -230,7 +283,10 @@ export default function (pi: ExtensionAPI) {
       const formatted = formatDiagnostics(filePath, result, ctx.cwd, result.documentContent);
       if (!formatted) return;
 
-      ctx.ui.notify(formatted.trim(), "warning");
+      const notification = diagnosticNotification(result.status, formatted);
+      if (notification && ctx.hasUI) {
+        ctx.ui.notify(notification.message, notification.type);
+      }
 
       return {
         content: [...event.content, { type: "text" as const, text: formatted }],
@@ -283,6 +339,12 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     configWatcher?.close();
     configWatcher = null;
+    validationProgressHandler = null;
+    workingMessageController?.reset();
+    workingMessageController = null;
+    statusSetter?.(undefined);
+    statusSetter = null;
+    configWarningNotifier = null;
     pendingNewFiles.clear();
     pendingBashSnapshots.clear();
     await reloadTail;
