@@ -2,6 +2,7 @@ import {
   createLocalBashOperations,
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { createServerManager } from "./src/server-manager.js";
 import {
   createWorkingMessageController,
@@ -38,7 +39,11 @@ import { resolve } from "node:path";
 import { lstat, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { isAbortError } from "./src/abort.js";
-import { deliverLateDiagnostics } from "./src/late-delivery.js";
+import {
+  deliverLateDiagnostics,
+  LSP_DIAGNOSTICS_MESSAGE_TYPE,
+} from "./src/late-delivery.js";
+import { renderDiagnosticMessage } from "./src/message-renderer.js";
 import { diagnosticNotification } from "./src/notifications.js";
 import {
   captureBashChangeSnapshot,
@@ -129,6 +134,12 @@ export default function (pi: ExtensionAPI) {
       resolveCommand: which,
     });
   }
+
+  pi.registerMessageRenderer(
+    LSP_DIAGNOSTICS_MESSAGE_TYPE,
+    (message, { expanded }, theme) =>
+      new Text(renderDiagnosticMessage(message, expanded, theme), 1, 0),
+  );
 
   pi.on("session_start", async (_event, ctx) => {
     workingMessageController?.reset();
