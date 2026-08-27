@@ -13,6 +13,7 @@ import {
 import {
   captureBashChangeSnapshot,
   prepareBashDiagnostics,
+  queueDiagnosticsAfterBash,
   resyncAfterBash,
 } from "../src/bash-awareness.js";
 import { createServerManager } from "../src/server-manager.js";
@@ -229,6 +230,35 @@ describe("bash change awareness", () => {
         [pathToFileURL(deletedMarkerPath).href, FileChangeType.Deleted],
       ]),
     );
+  });
+
+  it("queues user-bash diagnostics without triggering a turn", async () => {
+    const root = await makeTempDir();
+    const manager = createServerManager({ maxRetries: 0 });
+    managers.push(manager);
+    const config = fakeConfig();
+    const filePath = await openCleanDocument(manager, config, root);
+    const before = await captureBashChangeSnapshot(manager);
+    assert.ok(before);
+    await writeFile(filePath, "broken\n");
+
+    const sent: Array<{
+      message: LspDiagnosticsMessage;
+      options: { deliverAs: "steer" };
+    }> = [];
+    const prepared = await queueDiagnosticsAfterBash({
+      before,
+      manager,
+      servers: [config],
+      cwd: root,
+      sendMessage: (message, options) => sent.push({ message, options }),
+    });
+    await Promise.all(prepared.lateDeliveries);
+
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0]?.message.customType, "lsp-lite-diagnostics");
+    assert.match(sent[0]?.message.content ?? "", /bash error/u);
+    assert.deepEqual(sent[0]?.options, { deliverAs: "steer" });
   });
 
   it("late-delivers a changed result after the soft deadline", async () => {

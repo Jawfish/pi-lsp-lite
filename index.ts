@@ -1,4 +1,7 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  createLocalBashOperations,
+  type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import { createServerManager } from "./src/server-manager.js";
 import { languageForFile, checkExtensionOverlaps, builtinLanguages, type LanguageServerConfig } from "./src/languages.js";
 import { formatDiagnostic, formatDiagnostics } from "./src/format.js";
@@ -15,6 +18,7 @@ import { deliverLateDiagnostics } from "./src/late-delivery.js";
 import {
   captureBashChangeSnapshot,
   prepareBashDiagnostics,
+  queueDiagnosticsAfterBash,
   resyncAfterBash,
   type BashChangeSnapshot,
 } from "./src/bash-awareness.js";
@@ -187,6 +191,45 @@ export default function (pi: ExtensionAPI) {
       if (ctx.signal?.aborted || isAbortError(err)) return;
       console.error("[pi-lsp-lite]", err);
     }
+  });
+
+  pi.on("user_bash", async (_event, ctx) => {
+    let before: BashChangeSnapshot | null;
+    try {
+      before = await captureBashChangeSnapshot(manager);
+    } catch (error) {
+      if (ctx.signal?.aborted || isAbortError(error)) return;
+      console.error("[pi-lsp-lite]", error);
+      return;
+    }
+    if (!before) return;
+
+    const local = createLocalBashOperations();
+    return {
+      operations: {
+        async exec(command, cwd, options) {
+          const result = await local.exec(command, cwd, options);
+          try {
+            const prepared = await queueDiagnosticsAfterBash({
+              before,
+              manager,
+              servers,
+              cwd,
+              sendMessage: (message, sendOptions) =>
+                pi.sendMessage(message, sendOptions),
+              signal: options.signal,
+            });
+            for (const delivery of prepared.lateDeliveries) {
+              monitorLateDelivery(delivery, options.signal);
+            }
+          } catch (error) {
+            if (options.signal?.aborted || isAbortError(error)) return result;
+            console.error("[pi-lsp-lite]", error);
+          }
+          return result;
+        },
+      },
+    };
   });
 
   pi.on("session_shutdown", async () => {

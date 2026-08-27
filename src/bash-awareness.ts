@@ -15,6 +15,8 @@ import {
 import { formatDiagnostics } from "./format.js";
 import {
   deliverLateDiagnostics,
+  LSP_DIAGNOSTICS_MESSAGE_TYPE,
+  type LspDiagnosticsMessage,
   type SendLspDiagnosticsMessage,
 } from "./late-delivery.js";
 import { FileChangeType } from "vscode-languageserver-protocol";
@@ -50,8 +52,14 @@ export interface PrepareBashDiagnosticsOptions {
   signal?: AbortSignal;
 }
 
+export interface QueueDiagnosticsAfterBashOptions
+  extends ResyncAfterBashOptions {
+  sendMessage: SendLspDiagnosticsMessage;
+}
+
 export interface PreparedBashDiagnostics {
   content: string;
+  messages: LspDiagnosticsMessage[];
   lateDeliveries: Promise<void>[];
 }
 
@@ -121,6 +129,23 @@ export async function resyncAfterBash({
   };
 }
 
+export async function queueDiagnosticsAfterBash({
+  sendMessage,
+  ...resyncOptions
+}: QueueDiagnosticsAfterBashOptions): Promise<PreparedBashDiagnostics> {
+  const { validations } = await resyncAfterBash(resyncOptions);
+  const prepared = prepareBashDiagnostics({
+    validations,
+    cwd: resyncOptions.cwd,
+    sendMessage,
+    signal: resyncOptions.signal,
+  });
+  for (const message of prepared.messages) {
+    sendMessage(message, { deliverAs: "steer" });
+  }
+  return prepared;
+}
+
 export function prepareBashDiagnostics({
   validations,
   cwd,
@@ -128,6 +153,7 @@ export function prepareBashDiagnostics({
   signal,
 }: PrepareBashDiagnosticsOptions): PreparedBashDiagnostics {
   const content: string[] = [];
+  const messages: LspDiagnosticsMessage[] = [];
   const lateDeliveries: Promise<void>[] = [];
 
   for (const { filePath, outcome } of validations) {
@@ -137,7 +163,15 @@ export function prepareBashDiagnostics({
       cwd,
       outcome.initial.documentContent,
     );
-    if (formatted) content.push(formatted);
+    if (formatted) {
+      content.push(formatted);
+      messages.push({
+        customType: LSP_DIAGNOSTICS_MESSAGE_TYPE,
+        content: formatted,
+        display: true,
+        details: { filePath },
+      });
+    }
     lateDeliveries.push(
       deliverLateDiagnostics({
         cwd,
@@ -149,5 +183,5 @@ export function prepareBashDiagnostics({
     );
   }
 
-  return { content: content.join(""), lateDeliveries };
+  return { content: content.join(""), messages, lateDeliveries };
 }
