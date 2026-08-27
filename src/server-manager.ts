@@ -76,6 +76,7 @@ export interface ServerManager {
   ): Promise<EditDiagnosticOutcome>;
   status(): ServerStatus[];
   snapshotTargets(): ChangeDetectionTarget[];
+  closeDocument(filePath: string): void;
   getAllDiagnostics(): Map<string, Diagnostic[]>;
   shutdownAll(): Promise<void>;
 }
@@ -621,6 +622,20 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         rootPatterns: [...server.config.rootPatterns],
         documentUris: [...server.openDocuments.keys()],
       }));
+    },
+
+    closeDocument(filePath: string): void {
+      const uri = fileUri(filePath);
+      const active = activeEdits.get(uri);
+      active?.controller.abort(new SupersededEditError());
+      if (activeEdits.get(uri) === active) activeEdits.delete(uri);
+
+      for (const server of servers.values()) {
+        if (!server.openDocuments.has(uri)) continue;
+        server.client.didClose(uri);
+        server.openDocuments.delete(uri);
+        resetIdleTimer(server);
+      }
     },
 
     getAllDiagnostics(): Map<string, Diagnostic[]> {
