@@ -2,7 +2,7 @@
 
 ## Overview
 
-pi-lsp-lite is a [pi extension](https://github.com/mariozechner/pi) that hooks into the `tool_result` event for `write` and `edit` tool calls. When a supported file is modified, it routes the file through a long-lived LSP server and appends diagnostics to the tool result. A soft deadline bounds this blocking append; changed results that finish later enter agent context as a custom message.
+pi-lsp-lite is a [pi extension](https://github.com/mariozechner/pi) that checks files after `write`, `edit`, and `bash` tool calls and user `!` commands. When a supported file changes, it routes the file through a long-lived LSP server. A soft deadline bounds results appended to tool output. Changed results that finish later enter agent context as a custom message.
 
 ## Module layout
 
@@ -14,6 +14,10 @@ src/
   install-registry.ts  → known install commands for built-in servers
   client.ts            → LSP protocol client (JSON-RPC over stdio)
   server-manager.ts    → server lifecycle and edit orchestration
+  change-detection.ts  → tracked-file snapshots and comparison
+  bash-awareness.ts    → bash resync and diagnostic delivery
+  late-delivery.ts     → changed background-result messages
+  abort.ts             → abort-aware waits and delays
   format.ts            → diagnostic formatting for agent consumption
   util.ts              → file URI, binary lookup, workspace root detection
 test/
@@ -35,6 +39,18 @@ agent calls write/edit
   → format.ts: filter to errors+warnings, add source context, format compiler-style text and cross-file details
   → index.ts: append the initial text to tool_result content
   → late-delivery.ts: inject a changed final result as lsp-lite-diagnostics
+```
+
+```text
+agent bash tool or user ! command
+  → index.ts: snapshot open documents and root markers before execution
+  → pi executes the command
+  → change-detection.ts: compare mtime and size after execution
+  → server-manager.ts: close deleted documents
+  → client.ts: notify servers that registered for watched-file changes
+  → bash-awareness.ts: re-read and validate changed open documents
+  → index.ts: append agent-bash results or queue user-bash messages
+  → late-delivery.ts: inject changed final results after the soft deadline
 ```
 
 ## Key design choices
@@ -92,6 +108,22 @@ The client requests `relatedInformation` and keeps the full `Diagnostic` objects
 
 For each changed cross-file result, the client keeps up to three diagnostics. Errors come before warnings. The cross-file footer uses the same line formatter as target-file results and `/lsp-diag`.
 
+### Bash change detection
+
+Before an agent `bash` tool or user `!` command runs, `index.ts` asks the server manager for its running roots and open document URIs. If no server runs, capture returns before any file metadata call. Each snapshot records the modification time and size of open documents. It also includes configured root patterns and these standard markers:
+
+- `go.mod`
+- `Cargo.toml`
+- `tsconfig.json`
+- `package.json`
+- `compile_commands.json`
+
+A second snapshot after command completion classifies modified and created paths as changed, and missing paths as deleted. The server manager sends `didClose` for deleted open documents. It reads changed open documents and submits them through the same per-URI queue, soft deadline, supersession, formatting, and late-delivery path used by write and edit tools.
+
+The client advertises dynamic `workspace/didChangeWatchedFiles` registration. It acknowledges `client/registerCapability` and stores registration IDs for that server. Bash diffs route created, changed, and deleted events by server key. The client waits for this registration before it sends a watched-file notification.
+
+Agent bash diagnostics append to the bash tool result. The `user_bash` hook wraps `createLocalBashOperations()` and queues initial diagnostic messages with `deliverAs: "steer"`. It uses the same option for changed final results. This delivery keeps pi idle instead of starting an agent turn.
+
 ### Per-language diagnostic timeouts
 
 Each built-in language server has a default diagnostic timeout calibrated to its real-world performance:
@@ -147,12 +179,14 @@ Config is not hot-reloaded — `/reload` picks up changes via `session_start`.
 
 ## Extension hooks used
 
-| Hook               | Purpose                                                                              |
-| ------------------ | ------------------------------------------------------------------------------------ |
-| `tool_result`      | Intercept write/edit results, append diagnostics                                     |
-| `session_start`    | Load config, create server manager                                                   |
-| `session_shutdown` | Kill all servers                                                                     |
-| `registerCommand`  | `/lsp-status`, `/lsp-diag`, `/lsp-add`, `/lsp-remove`, `/lsp-toggle`, `/lsp-install` |
+| Hook               | Purpose                                                                                          |
+| ------------------ | ------------------------------------------------------------------------------------------------ |
+| `tool_call`        | Record new writes and capture tracked files before agent bash                                    |
+| `tool_result`      | Append write/edit diagnostics and resync files after agent bash                                  |
+| `user_bash`        | Wrap local `!` execution, then resync and queue diagnostics                                      |
+| `session_start`    | Load config and create the server manager                                                        |
+| `session_shutdown` | Clear snapshots and kill all servers                                                             |
+| `registerCommand`  | Provide `/lsp-status`, `/lsp-diag`, `/lsp-add`, `/lsp-remove`, `/lsp-toggle`, and `/lsp-install` |
 
 ## Adding a language
 

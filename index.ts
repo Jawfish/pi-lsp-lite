@@ -1,4 +1,7 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  createLocalBashOperations,
+  type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import { createServerManager } from "./src/server-manager.js";
 import { languageForFile, checkExtensionOverlaps, builtinLanguages, type LanguageServerConfig } from "./src/languages.js";
 import { formatDiagnostic, formatDiagnostics } from "./src/format.js";
@@ -12,13 +15,32 @@ import { lstat, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { isAbortError } from "./src/abort.js";
 import { deliverLateDiagnostics } from "./src/late-delivery.js";
+import {
+  captureBashChangeSnapshot,
+  prepareBashDiagnostics,
+  queueDiagnosticsAfterBash,
+  resyncAfterBash,
+  type BashChangeSnapshot,
+} from "./src/bash-awareness.js";
 
 export default function (pi: ExtensionAPI) {
   let servers: LanguageServerConfig[] = [];
   let manager = createServerManager({});
   const pendingNewFiles = new Map<string, boolean>();
+  const pendingBashSnapshots = new Map<string, BashChangeSnapshot>();
+
+  function monitorLateDelivery(
+    delivery: Promise<void>,
+    signal?: AbortSignal,
+  ): void {
+    void delivery.catch((error: unknown) => {
+      if (signal?.aborted || isAbortError(error)) return;
+      console.error("[pi-lsp-lite]", error);
+    });
+  }
 
   async function initConfig(cwd: string) {
+    pendingBashSnapshots.clear();
     await manager.shutdownAll();
     const resolved = await loadConfig(cwd);
     servers = resolved.servers;
@@ -50,6 +72,17 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
+    if (event.toolName === "bash") {
+      try {
+        const snapshot = await captureBashChangeSnapshot(manager);
+        if (snapshot) pendingBashSnapshots.set(event.toolCallId, snapshot);
+      } catch (error) {
+        if (ctx.signal?.aborted || isAbortError(error)) return;
+        console.error("[pi-lsp-lite]", error);
+      }
+      return;
+    }
+
     if (event.toolName !== "write") return;
 
     const rawPath = event.input?.path;
@@ -70,6 +103,44 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", async (event, ctx) => {
+    if (event.toolName === "bash") {
+      const before = pendingBashSnapshots.get(event.toolCallId);
+      pendingBashSnapshots.delete(event.toolCallId);
+      if (!before) return;
+
+      try {
+        const { validations } = await resyncAfterBash({
+          before,
+          manager,
+          servers,
+          cwd: ctx.cwd,
+          signal: ctx.signal,
+        });
+        const prepared = prepareBashDiagnostics({
+          validations,
+          cwd: ctx.cwd,
+          sendMessage: (message, options) => pi.sendMessage(message, options),
+          signal: ctx.signal,
+        });
+        for (const delivery of prepared.lateDeliveries) {
+          monitorLateDelivery(delivery, ctx.signal);
+        }
+        if (!prepared.content) return;
+
+        if (ctx.hasUI) ctx.ui.notify(prepared.content.trim(), "warning");
+        return {
+          content: [
+            ...event.content,
+            { type: "text" as const, text: prepared.content },
+          ],
+        };
+      } catch (error) {
+        if (ctx.signal?.aborted || isAbortError(error)) return;
+        console.error("[pi-lsp-lite]", error);
+      }
+      return;
+    }
+
     if (event.toolName !== "write" && event.toolName !== "edit") return;
 
     const isNewFile = event.toolName === "write" && pendingNewFiles.get(event.toolCallId) === true;
@@ -97,16 +168,16 @@ export default function (pi: ExtensionAPI) {
         signal: ctx.signal,
       });
       if (outcome.superseded) return;
-      void deliverLateDiagnostics({
-        cwd: ctx.cwd,
-        filePath,
-        outcome,
-        sendMessage: (message, options) => pi.sendMessage(message, options),
-        signal: ctx.signal,
-      }).catch((error: unknown) => {
-        if (ctx.signal?.aborted || isAbortError(error)) return;
-        console.error("[pi-lsp-lite]", error);
-      });
+      monitorLateDelivery(
+        deliverLateDiagnostics({
+          cwd: ctx.cwd,
+          filePath,
+          outcome,
+          sendMessage: (message, options) => pi.sendMessage(message, options),
+          signal: ctx.signal,
+        }),
+        ctx.signal,
+      );
       const result = outcome.initial;
       const formatted = formatDiagnostics(filePath, result, ctx.cwd, result.documentContent);
       if (!formatted) return;
@@ -122,8 +193,48 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  pi.on("user_bash", async (_event, ctx) => {
+    let before: BashChangeSnapshot | null;
+    try {
+      before = await captureBashChangeSnapshot(manager);
+    } catch (error) {
+      if (ctx.signal?.aborted || isAbortError(error)) return;
+      console.error("[pi-lsp-lite]", error);
+      return;
+    }
+    if (!before) return;
+
+    const local = createLocalBashOperations();
+    return {
+      operations: {
+        async exec(command, cwd, options) {
+          const result = await local.exec(command, cwd, options);
+          try {
+            const prepared = await queueDiagnosticsAfterBash({
+              before,
+              manager,
+              servers,
+              cwd,
+              sendMessage: (message, sendOptions) =>
+                pi.sendMessage(message, sendOptions),
+              signal: options.signal,
+            });
+            for (const delivery of prepared.lateDeliveries) {
+              monitorLateDelivery(delivery, options.signal);
+            }
+          } catch (error) {
+            if (options.signal?.aborted || isAbortError(error)) return result;
+            console.error("[pi-lsp-lite]", error);
+          }
+          return result;
+        },
+      },
+    };
+  });
+
   pi.on("session_shutdown", async () => {
     pendingNewFiles.clear();
+    pendingBashSnapshots.clear();
     await manager.shutdownAll();
   });
 

@@ -3,12 +3,19 @@ import assert from "node:assert/strict";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { createServerManager } from "../../src/server-manager.js";
 import { builtinLanguages as languages } from "../../src/languages.js";
 import { pollUntil } from "../poll-until.js";
 import { handleFinal } from "../server-manager-helpers.js";
+import {
+  captureBashChangeSnapshot,
+  resyncAfterBash,
+} from "../../src/bash-awareness.js";
 
 const goConfig = languages.find((l) => l.id === "go")!;
+const execFileAsync = promisify(execFile);
 
 describe("gopls integration", { skip: !process.env.INTEGRATION }, () => {
   let manager: ReturnType<typeof createServerManager>;
@@ -59,6 +66,43 @@ describe("gopls integration", { skip: !process.env.INTEGRATION }, () => {
 
     const hasErrors = result.diagnostics.some((d) => d.severity === 1);
     assert.equal(hasErrors, false, "expected no error diagnostics on clean file");
+  });
+
+  it("detects a syntax error written by bash", async () => {
+    const filePath = join(dir, "bash_edit.go");
+    await writeFile(filePath, "package main\n");
+    await handleFinal(manager, filePath, goConfig, dir);
+    const before = await captureBashChangeSnapshot(manager);
+    assert.ok(before);
+
+    await execFileAsync(
+      "bash",
+      [
+        "-c",
+        `printf 'package main\\n\\nfunc broken( {\\n' > "$1"`,
+        "pi-lsp-lite",
+        filePath,
+      ],
+      { cwd: dir },
+    );
+    const { validations } = await resyncAfterBash({
+      before,
+      manager,
+      servers: [goConfig],
+      cwd: dir,
+    });
+    assert.equal(validations.length, 1);
+    const outcome = validations[0]!.outcome;
+    const result = (await outcome.pending) ?? outcome.initial;
+
+    assert.equal(result.status, "ok");
+    assert.ok(
+      result.diagnostics.some((diagnostic) => diagnostic.severity === 1),
+      "expected gopls to report the bash-written syntax error",
+    );
+
+    await writeFile(filePath, "package main\n");
+    await handleFinal(manager, filePath, goConfig, dir);
   });
 
   it("detects cross-file breakage", async () => {

@@ -10,6 +10,9 @@ import {
   ShutdownRequest,
   ExitNotification,
   PublishDiagnosticsNotification,
+  RegistrationRequest,
+  DidChangeWatchedFilesNotification,
+  WatchKind,
   DiagnosticSeverity,
   DocumentDiagnosticReportKind,
   DocumentDiagnosticRequest,
@@ -18,9 +21,11 @@ import {
   type Diagnostic,
   type DocumentDiagnosticReport,
   type FullDocumentDiagnosticReport,
+  type FileEvent,
   type InitializeResult,
   type TextDocumentSyncKind,
 } from "vscode-languageserver-protocol/node";
+import { writeFile } from "node:fs/promises";
 
 export interface FakeServerOptions {
   diagnosticDelay?: number;
@@ -43,6 +48,8 @@ export interface FakeServerOptions {
   pushAfterPullDelay?: number;
   pushAfterPullDiagnostics?: Map<string, Diagnostic[]>;
   pushAfterPullOnlyOnce?: boolean;
+  registerWatchedFiles?: boolean;
+  watchedFilesLogPath?: string;
 }
 
 const defaultDiagnostic: Diagnostic = {
@@ -72,6 +79,8 @@ export function startFakeServer(options: FakeServerOptions = {}) {
   const attemptCounts = new Map<string, number>();
   const pullCounts = new Map<string, number>();
   let relatedInformationSupported = false;
+  let watchedFilesDynamicRegistrationSupported = false;
+  let watchedFilesRegistrationAcknowledged = false;
 
   const connection = createProtocolConnection(
     new StreamMessageReader(process.stdin),
@@ -87,6 +96,8 @@ export function startFakeServer(options: FakeServerOptions = {}) {
     }
     relatedInformationSupported =
       params.capabilities.textDocument?.publishDiagnostics?.relatedInformation === true;
+    watchedFilesDynamicRegistrationSupported =
+      params.capabilities.workspace?.didChangeWatchedFiles?.dynamicRegistration === true;
     const result: InitializeResult = {
       capabilities: {
         textDocumentSync: 1 as TextDocumentSyncKind,
@@ -102,7 +113,46 @@ export function startFakeServer(options: FakeServerOptions = {}) {
     return result;
   });
 
-  connection.onNotification(InitializedNotification.type, () => {});
+  function recordWatchedFiles(changes: FileEvent[]): void {
+    if (!options.watchedFilesLogPath) return;
+    void writeFile(
+      options.watchedFilesLogPath,
+      JSON.stringify({
+        registrationAcknowledged: watchedFilesRegistrationAcknowledged,
+        changes,
+      }),
+      "utf-8",
+    );
+  }
+
+  connection.onNotification(InitializedNotification.type, () => {
+    if (!options.registerWatchedFiles || !watchedFilesDynamicRegistrationSupported) {
+      return;
+    }
+    void connection.sendRequest(RegistrationRequest.type, {
+      registrations: [
+        {
+          id: "fake-watched-files",
+          method: DidChangeWatchedFilesNotification.method,
+          registerOptions: {
+            watchers: [
+              {
+                globPattern: "**/*",
+                kind: WatchKind.Create | WatchKind.Change | WatchKind.Delete,
+              },
+            ],
+          },
+        },
+      ],
+    }).then(() => {
+      watchedFilesRegistrationAcknowledged = true;
+      recordWatchedFiles([]);
+    });
+  });
+
+  connection.onNotification(DidChangeWatchedFilesNotification.type, (params) => {
+    recordWatchedFiles(params.changes);
+  });
 
   function diagnosticsForClient(diagnostics: Diagnostic[]): Diagnostic[] {
     if (relatedInformationSupported) return diagnostics;
@@ -259,6 +309,8 @@ if (process.argv.includes("--run")) {
     if (raw.neverPullUris) options.neverPullUris = raw.neverPullUris;
     if (raw.pushAfterPullDelay !== undefined) options.pushAfterPullDelay = raw.pushAfterPullDelay;
     if (raw.pushAfterPullOnlyOnce) options.pushAfterPullOnlyOnce = raw.pushAfterPullOnlyOnce;
+    if (raw.registerWatchedFiles) options.registerWatchedFiles = raw.registerWatchedFiles;
+    if (raw.watchedFilesLogPath) options.watchedFilesLogPath = raw.watchedFilesLogPath;
     if (raw.pushAfterPullDiagnostics) {
       options.pushAfterPullDiagnostics = new Map(Object.entries(raw.pushAfterPullDiagnostics));
     }

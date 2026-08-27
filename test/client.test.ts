@@ -4,6 +4,9 @@ import { spawn } from "node:child_process";
 import { createLspClient } from "../src/client.js";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { FileChangeType } from "vscode-languageserver-protocol";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -664,5 +667,31 @@ describe("LspClient", () => {
     assert.equal(all.size, 1, "should only contain URIs with non-empty diagnostics");
 
     await client.shutdown();
+  });
+
+  it("does not send watched-file events without registration", async () => {
+    const logPath = join(
+      tmpdir(),
+      `pi-lsp-unregistered-watch-${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
+    );
+    const child = spawnFake({ watchedFilesLogPath: logPath });
+    const client = createLspClient(child);
+    await client.initialize("/tmp/test-workspace");
+
+    const sent = client.didChangeWatchedFiles([
+      {
+        uri: "file:///tmp/test-workspace/go.mod",
+        type: FileChangeType.Changed,
+      },
+    ]);
+    assert.equal(sent, false);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await assert.rejects(
+      () => readFile(logPath, "utf-8"),
+      (error: NodeJS.ErrnoException) => error.code === "ENOENT",
+    );
+
+    await client.shutdown();
+    await rm(logPath, { force: true });
   });
 });

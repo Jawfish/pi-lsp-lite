@@ -8,7 +8,11 @@ import {
   type LspClient,
 } from "./client.js";
 import { type LanguageServerConfig, languageIdForFile } from "./languages.js";
-import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-protocol";
+import {
+  DiagnosticSeverity,
+  type Diagnostic,
+  type FileEvent,
+} from "vscode-languageserver-protocol";
 import {
   DEFAULT_DIAGNOSTIC_TIMEOUT,
   DEFAULT_DOCUMENT_IDLE_TIMEOUT,
@@ -22,6 +26,7 @@ import {
   isAbortError,
   raceWithAbort,
 } from "./abort.js";
+import type { ChangeDetectionTarget } from "./change-detection.js";
 
 export interface EditDiagnosticResult extends DiagnosticResult {
   delta: DiagnosticDelta;
@@ -37,6 +42,10 @@ export interface EditDiagnosticOutcome {
 export interface HandleEditOptions {
   isNewFile?: boolean;
   signal?: AbortSignal;
+}
+
+export interface RoutedWatchedFileChange extends FileEvent {
+  serverKeys: string[];
 }
 
 interface ManagedServer {
@@ -74,6 +83,9 @@ export interface ServerManager {
     options?: HandleEditOptions,
   ): Promise<EditDiagnosticOutcome>;
   status(): ServerStatus[];
+  snapshotTargets(): ChangeDetectionTarget[];
+  closeDocument(filePath: string): void;
+  didChangeWatchedFiles(changes: RoutedWatchedFileChange[]): void;
   getAllDiagnostics(): Map<string, Diagnostic[]>;
   shutdownAll(): Promise<void>;
 }
@@ -610,6 +622,43 @@ export function createServerManager(options: ServerManagerOptions = {}): ServerM
         openDocuments: s.openDocuments.size,
         lastActivity: s.lastActivity,
       }));
+    },
+
+    snapshotTargets(): ChangeDetectionTarget[] {
+      return Array.from(servers.values()).map((server) => ({
+        serverKey: server.serverKey,
+        root: server.root,
+        rootPatterns: [...server.config.rootPatterns],
+        documentUris: [...server.openDocuments.keys()],
+      }));
+    },
+
+    closeDocument(filePath: string): void {
+      const uri = fileUri(filePath);
+      const active = activeEdits.get(uri);
+      active?.controller.abort(new SupersededEditError());
+      if (activeEdits.get(uri) === active) activeEdits.delete(uri);
+
+      for (const server of servers.values()) {
+        if (!server.openDocuments.has(uri)) continue;
+        server.client.didClose(uri);
+        server.openDocuments.delete(uri);
+        resetIdleTimer(server);
+      }
+    },
+
+    didChangeWatchedFiles(changes: RoutedWatchedFileChange[]): void {
+      const changesByServer = new Map<string, FileEvent[]>();
+      for (const { serverKeys, uri, type } of changes) {
+        for (const serverKey of serverKeys) {
+          const serverChanges = changesByServer.get(serverKey) ?? [];
+          serverChanges.push({ uri, type });
+          changesByServer.set(serverKey, serverChanges);
+        }
+      }
+      for (const [serverKey, serverChanges] of changesByServer) {
+        servers.get(serverKey)?.client.didChangeWatchedFiles(serverChanges);
+      }
     },
 
     getAllDiagnostics(): Map<string, Diagnostic[]> {

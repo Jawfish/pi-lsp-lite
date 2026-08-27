@@ -145,6 +145,14 @@ describe("ServerManager", () => {
 
     const status1 = manager.status();
     assert.equal(status1.length, 1);
+    assert.deepEqual(manager.snapshotTargets(), [
+      {
+        serverKey: `fake:${dir}`,
+        root: dir,
+        rootPatterns: ["go.mod"],
+        documentUris: [pathToFileURL(filePath).href],
+      },
+    ]);
 
     await writeFile(filePath, "package main\n");
     const result2 = await handleInitial(manager, filePath, fakeConfig, dir);

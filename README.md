@@ -39,6 +39,14 @@ The extension appends these diagnostics to the tool result, so the agent can sel
 
 Validation blocks the tool result for at most `softDeadline` (10 seconds by default). If validation continues and finds different diagnostics, the extension injects the final result as an `lsp-lite-diagnostics` message. It does not start a model turn while the agent is idle.
 
+## Bash changes
+
+The extension also checks files after agent `bash` tools and user `!` commands. Before the command, it snapshots each open document and workspace marker. After the command, it compares file modification times and sizes. It skips this work when no language server is running.
+
+The extension reads each changed open document again, sends it to its server, and validates it. For a deleted document, it sends `didClose` and removes the stored diagnostics. A server that registers for `workspace/didChangeWatchedFiles` also receives events for changed documents and root markers such as `go.mod`, `Cargo.toml`, `tsconfig.json`, `package.json`, and `compile_commands.json`.
+
+Agent `bash` diagnostics append to the tool result when ready before the soft deadline. Later results use the same deduplicated `lsp-lite-diagnostics` message as write and edit tools. Pi queues results from user `!` commands for the next turn. These messages leave an idle pi session idle.
+
 ## Commands
 
 | Command        | What it does                                                            |
@@ -92,7 +100,7 @@ Project config merges over global for safe tuning fields. Repositories can disab
 
 ## How it works
 
-1. Agent writes/edits a file
+1. Agent writes or edits a file
 2. Extension detects the language, finds the workspace root
 3. Spawns (or reuses) an LSP server for that language + root
 4. Sends `didChange`, then pulls diagnostics when the server supports LSP 3.17 diagnostic requests
